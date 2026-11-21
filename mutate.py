@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Copyright (C) 2026 the DoomTeX authors
+# Copyright (C) 2026 Nicolas Rooney
 """Break the engine on purpose and confirm check.py notices.
 
 A check that has never been watched to fail has an unknown polarity and an

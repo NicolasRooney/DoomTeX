@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Copyright (C) 2026 the DoomTeX authors
+# Copyright (C) 2026 Nicolas Rooney
 """Regression harness for the TeX Doom renderer.
 
 Run this after every change.  It is deliberately strict: several of the bugs
