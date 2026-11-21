@@ -1,0 +1,20 @@
+# Game data.  Never commit a WAD: doom.wad and doom2.wad are commercial, and
+# the only WAD that belongs in this repository is the hand-built test.wad.
+*.wad
+*.WAD
+!test.wad
+
+# Everything check.py and mutate.py write.
+build/
+
+# What a run of pdftex or play.py leaves beside the sources: play.py's own
+# fixture, and the log and recording of whatever was last compiled.
+dtplay.*
+*.log
+*.aux
+*.pdf
+*.dtd
+
+# Python
+__pycache__/
+*.pyc

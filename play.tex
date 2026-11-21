@@ -1,0 +1,302 @@
+%% SPDX-License-Identifier: GPL-2.0-or-later
+%% Copyright (C) 2026 the DoomTeX authors
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% play.tex -- interactive mode.
+%%%
+%%% \read16 blocks for a line from the terminal, so TeX can run a real game
+%%% loop: draw a frame, wait for a key, step the simulation, repeat.  Frames go
+%%% to the terminal as ASCII (a PDF you cannot see until \end is not much use
+%%% while playing) and to the PDF as a recording, one page per frame.
+%%%
+%%%   \def\DTPLAY{1}\def\DTW{76}\def\DTH{60}\input doom.tex
+%%%   then one key and Enter a frame: w/s walk, a/d turn, z/c strafe,
+%%%   e use, f fire, 1-7 choose a weapon, q quit.  Anything else waits.
+%%%
+%%% Interactive mode needs TeX's normal interaction mode: under
+%%% -interaction=nonstopmode, \read16 gets EOF instead of blocking.
+%%%
+%%% \DTASC{n} decouples the two resolutions.  \DTW x \DTH is what the RENDERER
+%%% draws and what the PDF records; the terminal viewport is n x 2n pixels to
+%%% the cell, so it comes out \DTW/n wide and \DTH/2n tall.  The 2 is the
+%%% terminal's own cell aspect, which this file used to spend by printing
+%%% every other row and throwing the rest away.
+%%%
+%%%   \def\DTPLAY{1}\def\DTW{304}\def\DTH{240}\def\DTASC{4}
+%%%     -> a 304x240 PDF, played on a 76x60 terminal viewport
+%%%
+%%% \DTPIPE hands the frame to a front-end instead of drawing it: the raw
+%%% framebuffer goes to the terminal as hex between markers, and something on
+%%% the other end of the pipe decides how to show it.  play.py is that
+%%% something.
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\catcode`\@=11
+
+%%% Sixteen densities, brightest first: a terminal cell is "how much ink", so
+%%% a bright pixel wants a solid character and a dark one wants a space.
+\expandafter\gdef\csname dtAC0\endcsname{@}
+\expandafter\gdef\csname dtAC1\endcsname{@}
+\expandafter\gdef\csname dtAC2\endcsname{N}
+\expandafter\gdef\csname dtAC3\endcsname{N}
+\expandafter\gdef\csname dtAC4\endcsname{W}
+\expandafter\gdef\csname dtAC5\endcsname{M}
+\expandafter\gdef\csname dtAC6\endcsname{o}
+\expandafter\gdef\csname dtAC7\endcsname{c}
+\expandafter\gdef\csname dtAC8\endcsname{*}
+\expandafter\gdef\csname dtAC9\endcsname{+}
+\expandafter\gdef\csname dtACA\endcsname{=}
+\expandafter\gdef\csname dtACB\endcsname{-}
+\expandafter\gdef\csname dtACC\endcsname{:}
+\expandafter\gdef\csname dtACD\endcsname{.}
+\expandafter\gdef\csname dtACE\endcsname{.}
+\expandafter\gdef\csname dtACF\endcsname{ }
+
+%%% Which density a pixel gets used to be its low hex digit, because a
+%%% procedural surface is ramp*16 + shade and the shade IS a brightness.  That
+%%% stopped being true when real artwork arrived: a byte out of a picture is
+%%% whatever palette entry the artist used, and its low digit means nothing --
+%%% sprites came out as noise while the walls beside them looked fine.
+%%%
+%%% So index the ramp by the *colour* instead.  One pass over \DTPAL turns
+%%% each of the 256 entries into a density, which is right for both kinds of
+%%% pixel and needs no knowledge of which produced it.
+\newcount\dtALJ \newcount\dtALV
+%% wad.tex carries a hex-decode table, but it is only read when a WAD is
+%% loaded and ASCII mode has to work on the built-in map too.
+\ifcsname dtHV0\endcsname\else
+  \dtALJ=0
+  \dtWhile{\dtALJ<16}{%
+    \expandafter\xdef\csname dtHV\dt@hd{\the\dtALJ}\endcsname{\the\dtALJ}%
+    \advance\dtALJ by1\relax }%
+\fi
+\def\dt@hx#1#2{\csname dtHV#1\endcsname*16+\csname dtHV#2\endcsname}
+%%% The table stores the LUMA, 0..255, rather than the character it lands on.
+%%% A cell of the viewport is now the mean of the block behind it, and a mean
+%%% of sixteen density steps is a much coarser thing than a mean of 256 -- at
+%%% \DTASC{4} a cell averages 32 pixels and every bit of that precision is
+%%% real.  The character is chosen once, at the end, from the mean.
+\def\dtAsciiTable{%
+  \dtALJ=0
+  \expandafter\dt@lum\DTPAL\relax\relax\relax\relax\relax\relax}
+\def\dt@lum#1#2#3#4#5#6{%
+  \ifx\relax#1\else
+    %% Rec. 601 luma, near enough: green carries most of the brightness.
+    %% \dt@hx expands to a sum, not a number, so it needs its own brackets.
+    \dtALV=\numexpr(2*(\dt@hx#1#2)+5*(\dt@hx#3#4)+(\dt@hx#5#6))/8\relax
+    \ifnum\dtALV>255 \dtALV=255 \fi
+    \expandafter\xdef\csname dtLV\hx{\the\dtALJ}\endcsname{\the\dtALV}%
+    \advance\dtALJ by1
+    \expandafter\dt@lum
+  \fi}
+
+%%% ------------------------------------------------------ the viewport filter
+%%% One accumulator per viewport ROW, summing luma over the block.  A column
+%%% walk touches a whole column of cells, so this bank is what has to be live
+%%% at once; it is flushed into the row macros every \dtASN framebuffer
+%%% columns.  §4's banks run 1000..7000, so this one starts at 8000, and it
+%%% needs \SCRH/2 entries at the very most.
+\def\dtASB#1{\count\numexpr8000+(#1)\relax}
+\newcount\dtASN \newcount\dtASV \newcount\dtASX \newcount\dtASY
+\newcount\dtVPW \newcount\dtVPH \newcount\dtASA \newcount\dtASM
+\newcount\dtASW
+
+%%% n across, 2n down: the 2 is the terminal cell's aspect.  \DTASC{1} on a
+%%% 76x60 render is the 76x30 viewport this file has always produced, except
+%%% that the row it used to discard now counts toward the cell instead.
+\def\dtAsciiSetup{%
+  \dtASN=1
+  \expandafter\ifx\csname DTASC\endcsname\relax\else\dtASN=\DTASC\relax\fi
+  \ifnum\dtASN<1 \dtASN=1 \fi
+  \dtASV=\numexpr2*\dtASN\relax
+  \dtVPW=\SCRW \divide\dtVPW by\dtASN
+  \dtVPH=\SCRH \divide\dtVPH by\dtASV
+  \ifnum\dtVPW<1 \dtVPW=1 \fi
+  \ifnum\dtVPH<1 \dtVPH=1 \fi
+  %% A trailing partial block is dropped rather than averaged over a short
+  %% divisor, which would make the last cell of a row brighter than its
+  %% neighbours for no reason anyone could see.
+  \dtASW=\numexpr\dtVPW*\dtASN\relax
+  \dtASA=\numexpr\dtASN*\dtASV\relax
+  \message{[play.tex] viewport \the\dtVPW x\the\dtVPH\space cells of
+    \the\dtASN x\the\dtASV\space pixels, from a \the\SCRW x\the\SCRH\space
+    render}}
+
+%%% The renderer builds columns; a terminal needs rows.  Walk each column two
+%%% hex digits at a time and add its luma to the cell it falls in -- a
+%%% transpose and a box filter in one pass.
+\newcount\dtRY \newcount\dtCXA
+\def\dt@tr#1#2{\ifx\relax#1\expandafter\dt@trS\else\expandafter\dt@trN\fi
+  {#1#2}}
+\def\dt@trN#1{%
+  %% Rows past the last whole block fall off the bottom.  Without this guard
+  %% they would land in \dtASB\dtVPH, which is somebody else's register.
+  \ifnum\dtRY<\dtVPH
+    \advance\dtASB\dtRY by\csname dtLV#1\endcsname\relax
+  \fi
+  \advance\dtASY by1\relax
+  \ifnum\dtASY<\dtASV\else \dtASY=0 \advance\dtRY by1\relax \fi
+  \dt@tr}
+\def\dt@trS#1{}
+
+%%% One block-column finished: turn each accumulator into a character and
+%%% clear it for the next.
+\def\dt@trF{%
+  \dtRY=0
+  \dtWhile{\dtRY<\dtVPH}{%
+    \dtASM=\dtASB\dtRY
+    \divide\dtASM by\dtASA\relax
+    \divide\dtASM by16\relax
+    \ifnum\dtASM>15 \dtASM=15 \fi
+    \expandafter\xdef\csname dtRow\the\dtRY\endcsname
+      {\csname dtRow\the\dtRY\endcsname\csname dtAC\dt@hd{15-\dtASM}\endcsname}%
+    \dtASB\dtRY=0
+    \advance\dtRY by1\relax }}
+
+\def\dtAsciiFrame{%
+  \dtRY=0
+  \dtWhile{\dtRY<\dtVPH}{%
+    \expandafter\gdef\csname dtRow\the\dtRY\endcsname{}%
+    \dtASB\dtRY=0
+    \advance\dtRY by1\relax }%
+  \dtCXA=0 \dtASX=0
+  \dtWhile{\dtCXA<\dtASW}{%
+    \edef\dt@col{\csname dtFC\the\dtCXA\endcsname}%
+    \dtRY=0 \dtASY=0
+    \expandafter\dt@tr\dt@col\relax\relax
+    \advance\dtCXA by1\relax
+    \advance\dtASX by1\relax
+    \ifnum\dtASX<\dtASN\else \dtASX=0 \dt@trF \fi }%
+  \dtRY=0
+  \dtWhile{\dtRY<\dtVPH}{%
+    \immediate\write16{\csname dtRow\the\dtRY\endcsname}%
+    \advance\dtRY by1\relax }}
+
+%%% ------------------------------------------------------------- the raw pipe
+%%% \DTPIPE hands the framebuffer over instead of drawing it.  The columns go
+%%% out exactly as the PDF gets them -- \dtFC<x> is already the hex the inline
+%%% image carries -- so a front-end sees the true frame and can render it at
+%%% whatever fidelity its terminal has, in colour, at any viewport size.  That
+%%% is a decision this file is in no position to make and play.py is.
+%%%
+%%% This does not deadlock, and the reason is worth writing down: TeX flushes
+%%% the terminal immediately before every blocking read (term_input calls
+%%% update_terminal), so a driver that reads until [DTE] and only then sends a
+%%% key can never be waiting on bytes that are sitting in a buffer.
+%%%
+%%% The markers are bracketed because pdfTeX's own \shipout chatter -- [1],
+%%% and the map file on the first page -- shares this stream, and a reader
+%%% that took any hex-looking line would eat it.  A line inside the block is
+%%% frame data only if it is hex and nothing else.  For the same reason the
+%%% whole block is emitted BEFORE the \shipout: the page marker then falls
+%%% between blocks rather than through the middle of one.
+%%%
+%%% One block, one end marker, and the state comes first.  The state line is
+%%% longer than max_print_line and pdfTeX hard-wraps it mid-token -- without
+%%% inserting or dropping a character, so deleting the newlines puts it back
+%%% exactly, which is what check.py's track() has always relied on.  A reader
+%%% that took these lines one at a time would silently lose whichever field
+%%% straddled the wrap.
+\newif\ifdt@pipe
+\expandafter\ifx\csname DTPIPE\endcsname\relax\else\dt@pipetrue\fi
+
+%%% The same numbers as the human prompt, in a shape a regex can hold on to.
+\def\dtPipeState{%
+  \immediate\write16{[DTS] x \number\numexpr\PX/65536\relax\space
+    y \number\numexpr\PY/65536\relax\space ang \the\PA\space
+    sec \the\dtSECN\space floor \dtFloorZ\space eye
+    \number\numexpr\PZ/65536\relax\space hp \the\dtHEALTH\space
+    ar \the\dtARMOR\space am \dtAmmoNow\space wp \the\dtWEAP\space
+    got \the\dtNPICK\space kill \the\dtKILLS\space of \the\dtNMON\space
+    sc \the\dtSECRETS\space st \the\dtNSECRET\space
+    iv \the\dtINVUL\space ex \the\dtEXIT}}
+
+\def\dtPipeFrame{%
+  \dtPipeState
+  \immediate\write16{[DTF] \the\SCRW\space\the\SCRH}%
+  \dtCXA=0
+  \dtWhile{\dtCXA<\SCRW}{%
+    \immediate\write16{\csname dtFC\the\dtCXA\endcsname}%
+    \advance\dtCXA by1\relax }%
+  \immediate\write16{[DTE]}}
+
+%%% ------------------------------------------------------------- the game loop
+%%% Movement goes through \dtStepFwd (doom.tex), which is P_TryMove: collision
+%%% against the map, sliding along walls, and the floor follow.  This loop used
+%%% to teleport the camera straight through geometry.
+\newcount\dtRunning \newcount\dtKEYN
+
+\def\dtKeyLoop{%
+  \endlinechar=-1          % otherwise \read appends a space to every key
+  \dtAsciiTable            % after the WAD, so it sees the real palette
+  \dtAsciiSetup            % ...and after \SCRW/\SCRH are settled
+  %% The front-end needs the palette to put a colour on a frame, and this is
+  %% the only place it can get the RIGHT one: \DTPAL is the built-in ramps
+  %% until a WAD replaces it with PLAYPAL, so a driver that carried its own
+  %% copy would be wrong on exactly one of the two.  Once, not per frame.
+  \ifdt@pipe \immediate\write16{[DTPAL] \DTPAL}\fi
+  \dtRunning=1
+  \dtWhile{\dtRunning>0}{%
+    \dtSectorTick
+    \dtThingTick
+    \dtMissileTick
+    \dtPlayerTick
+    \dtAnimTick
+    %% Called in vertical mode, and that is fine: the scene build is entirely
+    %% global assignments into the column macros and emits nothing.
+    %%
+    %% This used to run inside a discarded \vbox, to absorb what looked like a
+    %% leak out of the sprite pass -- one Overfull hbox per column, only with a
+    %% WAD loaded.  The cause was a macro name collision: \dt@thingrot wrote
+    %% \dt@tr, which is also this file's transpose walker, so \dtAsciiFrame
+    %% below expanded a rotation digit instead of a loop and let the column
+    %% through as text.  The engine's macro is \dt@trot now.  Keep this call
+    %% bare: a \vbox here would swallow the next such bug in silence, and
+    %% check.py asserts that interactive mode produces no Overfull warnings.
+    \dtRenderScene
+    %% Before the \shipout, so the page marker pdfTeX prints falls outside
+    %% the block rather than through the middle of it.
+    \ifdt@pipe \dtPipeFrame \else \dtAsciiFrame \fi
+    \setbox0=\hbox{\cx=0
+      \dtWhile{\cx<\SCRW}{\dtEmitColumn{\the\cx}\advance\cx by1\relax }}%
+    \wd0=0pt \ht0=0pt \dp0=0pt
+    \shipout\hbox{\box0}%
+    \ifdt@pipe\else
+      \immediate\write16{^^J  \number\numexpr\PX/65536\relax,%
+        \number\numexpr\PY/65536\relax\space ang \the\PA\space
+        sec \the\dtSECN\space floor \dtFloorZ\space
+        hp \the\dtHEALTH\space am \dtAmmoNow\space
+        kill \the\dtKILLS/\the\dtNMON
+        -- w/s move, a/d turn, z/c strafe, e use, f fire, 1-7 weapon,
+        q quit:}%
+    \fi
+    \read16 to \dt@key
+    %% \dt@pk, not \dt@k: wad.tex uses \dt@k as scratch in the sprite-want
+    %% loop.  That runs at load and this runs in the key loop, so they do not
+    %% overlap today -- but they are one lazy sprite load away from doing so,
+    %% and the \dt@tr collision above is what that costs.
+    \edef\dt@pk{\dt@key}%
+    \ifnum\pdfstrcmp{\dt@pk}{q}=0 \dtRunning=0 \else
+      \ifnum\pdfstrcmp{\dt@pk}{w}=0 \dtStepFwd{2621440}\fi
+      \ifnum\pdfstrcmp{\dt@pk}{s}=0 \dtStepFwd{-2621440}\fi
+      \ifnum\pdfstrcmp{\dt@pk}{a}=0 \dtnorm\PA{\PA+512}\fi
+      \ifnum\pdfstrcmp{\dt@pk}{d}=0 \dtnorm\PA{\PA-512}\fi
+      \ifnum\pdfstrcmp{\dt@pk}{e}=0 \dtUse\fi
+      \ifnum\pdfstrcmp{\dt@pk}{f}=0 \dtFire\fi
+      %% Sideways, and the weapon in your hands: z and c step left and right
+      %% without turning, and 1..7 are Doom's own number keys.  Seven string
+      %% compares a keypress is nothing beside the frame that follows them.
+      \ifnum\pdfstrcmp{\dt@pk}{z}=0 \dtStepSide{2621440}\fi
+      \ifnum\pdfstrcmp{\dt@pk}{c}=0 \dtStepSide{-2621440}\fi
+      \dtKEYN=1
+      \dtWhile{\dtKEYN<8}{%
+        \ifnum\pdfstrcmp{\dt@pk}{\the\dtKEYN}=0
+          \dtSelectWeapon{\the\dtKEYN}%
+        \fi
+        \advance\dtKEYN by1\relax }%
+    \fi
+    %% The level ends when its exit is reached, exactly as the batch loop's
+    %% does: a switch pressed or a line crossed on this keypress has set
+    %% \dtEXIT, and there is no next frame to draw.
+    \ifnum\dtEXIT>0 \dtRunning=0 \fi
+  }%
+  \immediate\write16{^^J[doom.tex] quit.^^J}}
+\catcode`\@=12

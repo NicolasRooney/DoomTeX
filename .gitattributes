@@ -1,0 +1,8 @@
+# Line endings are LF in the repository and in every checkout, on every
+# platform.  The engine and the harness were tested that way, and mutate.py
+# matches multi-line targets against the source text.
+* text=auto eol=lf
+
+# Not text, whatever their bytes look like.
+*.wad binary
+*.gif binary

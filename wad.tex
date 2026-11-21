@@ -1,0 +1,1533 @@
+%% SPDX-License-Identifier: GPL-2.0-or-later
+%% Copyright (C) 2026 the DoomTeX authors
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%% wad.tex -- read a real Doom WAD in pure pdfTeX.
+%%%
+%%% \pdffiledump returns the hex bytes of any file region, expandably and with
+%%% no shell escape, so TeX can parse the actual binary format: the 12-byte
+%%% header, the lump directory, and the map's VERTEXES / LINEDEFS / SIDEDEFS /
+%%% SECTORS / SEGS / SSECTORS / NODES / THINGS structures.  PLAYPAL is copied
+%%% out verbatim, because a Doom palette and a PDF /Indexed colour space are
+%%% the same 768 bytes.
+%%%
+%%% Input by doom.tex when \DTWAD is defined, and it fills exactly the arrays
+%%% the built-in map does -- through the same \dtAdd... macros -- so nothing
+%%% downstream knows which of the two it is drawing.  In file order: integer
+%%% decoding and the lump directory, COLORMAP, sprites, the status bar's
+%%% pictures, wall textures and their masked middles, flats, and the loader
+%%% that calls all of them.
+%%%
+%%%   \dtLoadWAD{doom1.wad}{E1M1}
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\catcode`\@=11
+
+%%% -------------------------------------------------------- hex digit values
+\dt@q=0
+\dtWhile{\dt@q<16}{%
+  \expandafter\xdef\csname dtHV\dt@hd{\the\dt@q}\endcsname{\the\dt@q}%
+  \advance\dt@q by1\relax }
+%% accept lowercase too, in case a distribution differs
+\expandafter\gdef\csname dtHVa\endcsname{10}
+\expandafter\gdef\csname dtHVb\endcsname{11}
+\expandafter\gdef\csname dtHVc\endcsname{12}
+\expandafter\gdef\csname dtHVd\endcsname{13}
+\expandafter\gdef\csname dtHVe\endcsname{14}
+\expandafter\gdef\csname dtHVf\endcsname{15}
+
+%%% ------------------------------------------- little-endian integer decoding
+%%% NB: names are letters only.  \dtU32 would parse as \dtU followed by the
+%%% characters 32, because digits are not letters -- so \dtU16 and \dtU32
+%%% would silently define the same macro with conflicting parameter texts.
+\def\dtB#1#2{\csname dtHV#1\endcsname*16+\csname dtHV#2\endcsname}
+\def\dtUW#1#2#3#4{\number\numexpr\dtB{#1}{#2}+256*(\dtB{#3}{#4})\relax}
+\def\dtSW#1#2#3#4{\number\numexpr\dtUW{#1}{#2}{#3}{#4}%
+  -\ifnum\dtUW{#1}{#2}{#3}{#4}>32767 65536\else0\fi\relax}
+\def\dtUL#1#2#3#4#5#6#7#8{\number\numexpr\dtB{#1}{#2}+256*(\dtB{#3}{#4})%
+  +65536*(\dtB{#5}{#6})+16777216*(\dtB{#7}{#8})\relax}
+
+%%% \dtRead<n>{count}{offset} : read n bytes and leave the decoded value
+\def\dtWADFILE{}
+\def\dtRd#1#2{\csname dtRd@#1\endcsname{\pdffiledump offset #2 length #1
+  {\dtWADFILE}}}
+\expandafter\def\csname dtRd@2\endcsname#1{\expandafter\dtSW#1}
+\expandafter\def\csname dtRd@2u\endcsname#1{\expandafter\dtUW#1}
+\expandafter\def\csname dtRd@4\endcsname#1{\expandafter\dtUL#1}
+\def\dtS#1{\csname dtRd@2\endcsname{\pdffiledump offset #1 length 2
+  {\dtWADFILE}}}
+\def\dtUu#1{\csname dtRd@2u\endcsname{\pdffiledump offset #1 length 2
+  {\dtWADFILE}}}
+\def\dtL#1{\csname dtRd@4\endcsname{\pdffiledump offset #1 length 4
+  {\dtWADFILE}}}
+
+%%% ------------------------------------------------- lump name -> hex pattern
+%%% Lump names are 8 bytes, NUL padded.  Comparing them as hex strings avoids
+%%% any catcode trouble with the raw bytes.
+\newcount\dt@nc
+\def\dtNameHex#1{\gdef\dt@target{}\dt@nc=0 \dt@nhA#1\relax
+  \dtWhile{\dt@nc<8}{\xdef\dt@target{\dt@target00}\advance\dt@nc by1\relax }}
+\def\dt@nhA#1{\ifx\relax#1\else
+  \xdef\dt@target{\dt@target\hx{`#1}}\advance\dt@nc by1
+  \expandafter\dt@nhA\fi}
+
+%%% --------------------------------------------------------- directory lookup
+\newcount\dtNUML \newcount\dtDIR \newcount\dtENT
+\newcount\dtLPOS \newcount\dtLSIZE \newcount\dtFOUND
+
+%% \dtFindLump{NAME}{startentry}: sets \dtFOUND (entry index or -1),
+%% \dtLPOS, \dtLSIZE
+\def\dtFindLump#1#2{%
+  \dtNameHex{#1}%
+  \dtFOUND=-1 \dtENT=#2\relax
+  \dtWhile{\dtENT<\dtNUML}{%
+    \ifnum\dtFOUND<0
+      \edef\dt@nm{\pdffiledump offset
+        \number\numexpr\dtDIR+16*\dtENT+8\relax\space length 8 {\dtWADFILE}}%
+      %% \ifx would compare catcodes too: \pdffiledump yields catcode-12
+      %% characters while the hex table produces catcode-11 letters for A-F.
+      %% \pdfstrcmp compares character codes only.
+      \ifnum\pdfstrcmp{\dt@nm}{\dt@target}=0
+        \dtFOUND=\dtENT
+        \dtLPOS=\dtL{\number\numexpr\dtDIR+16*\dtENT\relax}\relax
+        \dtLSIZE=\dtL{\number\numexpr\dtDIR+16*\dtENT+4\relax}\relax
+      \fi
+    \fi
+    \advance\dtENT by1\relax }}
+
+%%% ==============================================================  COLORMAP
+%%% 34 tables of 256 bytes: COLORMAP[light][colour] is the palette index to
+%%% draw instead of `colour' at that light level.  The renderer's own surfaces
+%%% are shaded by adding 0..13 to a ramp base, which works only because those
+%%% bases are hand-picked rows that really do darken -- see the PLAYPAL note
+%%% in INTERNALS.md.  Real artwork has no such freedom: a sprite pixel is whatever
+%%% colour the artist used, so shading it needs Doom's own table.
+%%%
+%%% Keyed by the two hex characters of the source byte, because that is
+%%% exactly the form sprite pixels arrive in.  Nothing is decoded on the way
+%%% in or on the way out.
+\newcount\dtCML \newcount\dtCMJ
+%% Without a COLORMAP the walls would still dereference dtCM<light>@<byte>,
+%% and an undefined csname inside a nested \csname is a "Missing \endcsname"
+%% rather than a wrong pixel.  One identity row keeps that lookup total and
+%% \dtCMN pins the light to it, so a PWAD with no COLORMAP draws its textures
+%% at full brightness instead of failing to compile.
+\def\dt@identitycm{%
+  \dtCMJ=0
+  \dtWhile{\dtCMJ<256}{%
+    \expandafter\xdef\csname dtCM0@\hx{\the\dtCMJ}\endcsname{\hx{\the\dtCMJ}}%
+    \advance\dtCMJ by1\relax }%
+  \global\dtCMN=1 }
+\def\dtLoadColormap{%
+  \dtFindLump{COLORMAP}{0}%
+  \ifnum\dtFOUND<0
+    \message{[wad] no COLORMAP -- sprites will draw unshaded.}%
+    \dt@identitycm
+  \else
+    %% Thirty-three tables, not thirty-two.  The lump holds thirty-four: 0..31
+    %% are the light levels, which is what \dtCMN counts and what every clamp
+    %% in the renderer keeps inside, and table 32 is the inverse map Doom
+    %% draws the whole view through while the player is invulnerable.  It is
+    %% reached only through \dtFIXCM, never by a light level.
+    \dtCML=0
+    \dtWhile{\dtCML<33}{%
+      \edef\dt@cm{\pdffiledump offset
+        \number\numexpr\dtLPOS+256*\dtCML\relax\space length 256
+        {\dtWADFILE}}%
+      \dtCMJ=0
+      \expandafter\dt@cmscan\dt@cm
+      \advance\dtCML by1\relax }%
+    \global\let\dt@srPx\dt@srCM
+    \global\dtCMN=32
+    \message{[wad] COLORMAP: 32 light levels}%
+  \fi}
+%% Consumes a row two characters at a time.  \hx builds the key in the same
+%% uppercase hex \pdffiledump produces, so a lookup from sprite data hits.
+\def\dt@cmscan#1#2{%
+  \expandafter\xdef\csname dtCM\the\dtCML @\hx{\the\dtCMJ}\endcsname{#1#2}%
+  \advance\dtCMJ by1
+  \ifnum\dtCMJ<256 \expandafter\dt@cmscan\fi}
+
+%%% ================================================================  SPRITES
+%%% Sprite lumps live between the S_START and S_END markers and are named
+%%% <four characters><frame><rotation>, with an optional second frame and
+%%% rotation in bytes 6 and 7 when one picture serves two frames mirrored.
+%%% Matching only the first six bytes covers both spellings: POSSA1 is padded
+%%% with NULs past byte 6, and BOS2A1C1 carries its second frame there.
+%%%
+%%% Rotation 1 is the view of a thing facing you, so using it for every angle
+%%% gives sprites that always turn to the camera.  Rotation 0 means the
+%%% picture is the same from all sides, which is how every pickup is stored.
+\newcount\dtQS \newcount\dtQE \newcount\dtQJ
+\newcount\dtQN \newcount\dtQG
+\newcount\dtQW \newcount\dtQH \newcount\dtQC
+\newcount\dtQP \newcount\dtQT \newcount\dtQL \newcount\dtQK
+\newcount\dtQD
+\dtQN=0
+
+%% one unsigned byte
+\expandafter\def\csname dtRd@1\endcsname#1{%
+  \number\numexpr\expandafter\dtB#1\relax}
+\def\dtBy#1{\csname dtRd@1\endcsname{\pdffiledump offset #1 length 1
+  {\dtWADFILE}}}
+
+%% like \dtNameHex but with no padding, for a partial-name comparison
+\def\dtNameHexRaw#1{\gdef\dt@target{}\dt@nc=0 \dt@nhA#1\relax}
+
+%% \dtWantSprite{KEY} -- this map needs the picture for KEY (four characters
+%% and a frame letter).  Collected first and resolved in a single pass,
+%% because \dtFindLump scans the directory from a given entry and a WAD this
+%% size has a few thousand of them.
+%% The name and the frame letter are what identify a picture; the rotation
+%% is read back off whichever lumps match, because a thing needs all eight
+%% and four of them are stored inside the other four.
+\def\dtWantSprite#1{%
+  \ifcsname dtWX#1\endcsname\else
+    \expandafter\gdef\csname dtWX#1\endcsname{1}%
+    \expandafter\xdef\csname dtWK\the\dtQN\endcsname{#1}%
+    \dt@splitkey#1\relax
+    \global\advance\dtQN by1
+  \fi}
+%% four characters of name, then the frame letter
+\def\dt@splitkey#1#2#3#4#5\relax{%
+  \dtNameHexRaw{#1#2#3#4}%
+  \expandafter\xdef\csname dtWN\the\dtQN\endcsname{\dt@target}%
+  \dtNameHexRaw{#5}%
+  \expandafter\xdef\csname dtWR\the\dtQN\endcsname{\dt@target}}
+
+%% every frame of an animated type.  \dt@wbase/\dt@wty rather than the
+%% \dt@base/\dt@ty doom.tex uses for the same job at draw time: these run at
+%% load and those run per frame, so they do not overlap today -- and a name
+%% shared across that boundary is exactly what cost a day on \dt@tr.
+\def\dt@wantall#1{%
+  \edef\dt@wbase{\dt@dropf#1\relax}%
+  %% expanded to literal letters first, for the reason \dt@animframe records
+  \edef\dt@wseq{\csname dtMA\dt@wty\endcsname}%
+  \expandafter\dt@wantseq\dt@wseq\relax}
+\def\dt@wantseq#1{\ifx\relax#1\else
+  \edef\dt@next{\noexpand\dtWantSprite{\dt@wbase#1}}\dt@next
+  \expandafter\dt@wantseq\fi}
+
+%% ...and every frame of every state a monster can be in.  Five sequences
+%% rather than one, walked with the same \dt@wantseq: the state number is the
+%% only thing that changes, so this is a loop over dtOa<type>@0..4 handing
+%% each to the walker that already exists.
+%%
+%% The count register is \dtQK, which the sprite loader owns and is not
+%% holding at load time.  \dtJ is NOT free -- it is the bound of the thing
+%% loop this is called from, and INTERNALS section 6 records what borrowing one
+%% of those costs.
+\def\dt@wantstates#1{%
+  \edef\dt@wbase{\dt@dropf#1\relax}%
+  \dtQK=0
+  \dtWhile{\dtQK<5}{%
+    \ifcsname dtOa\dt@wty @\the\dtQK\endcsname
+      \edef\dt@wseq{\csname dtOa\dt@wty @\the\dtQK\endcsname}%
+      \expandafter\dt@wantseq\dt@wseq\relax
+    \fi
+    \advance\dtQK by1\relax }}
+
+%% ...and every frame of the MISSILE a thing puts into the world, which is
+%% the same argument a second level up and the first one where the pictures
+%% belong to something that is not on the map at all.  A fireball is spawned
+%% by an imp, so the imp is what has to be seen for BAL1 to be wanted; a
+%% rocket is spawned by the player, so what has to be seen is the launcher
+%% lying on the floor.  dtJm answers both.
+%%
+%% Two states, not five, and the sprite NAME comes out of dtJk per state
+%% rather than off the key: plasma flies as PLSS and explodes as PLSE, and
+%% wanting PLSSC..PLSSG instead would read five lumps that do not exist and
+%% drop the explosion to a billboard.
+\def\dt@wantmissile#1{%
+  \dtQK=0
+  \dtWhile{\dtQK<2}{%
+    \ifcsname dtJa#1@\the\dtQK\endcsname
+      \edef\dt@wbase{\csname dtJk#1@\the\dtQK\endcsname}%
+      \edef\dt@wseq{\csname dtJa#1@\the\dtQK\endcsname}%
+      \expandafter\dt@wantseq\dt@wseq\relax
+    \fi
+    \advance\dtQK by1\relax }}
+
+\def\dtLoadSprites{%
+  \ifnum\dtQN>0
+    \dtFindLump{S_START}{0}%
+    \ifnum\dtFOUND<0
+      \message{[wad] no S_START -- keeping placeholder sprites.}%
+    \else
+      \dtQS=\numexpr\dtFOUND+1\relax
+      \dtFindLump{S_END}{\the\dtQS}%
+      \ifnum\dtFOUND<0 \dtQE=\dtNUML \else \dtQE=\dtFOUND \fi
+      \dtQG=0 \dtQJ=\dtQS
+      \dtWhile{\dtQJ<\dtQE}{%
+        \edef\dt@nm{\pdffiledump offset
+          \number\numexpr\dtDIR+16*\dtQJ+8\relax\space length 8
+          {\dtWADFILE}}%
+        \expandafter\dt@nmsplit\dt@nm
+        \dtQK=0
+        \dtWhile{\dtQK<\dtQN}{%
+          \ifnum\pdfstrcmp{\dt@nA}{\csname dtWN\the\dtQK\endcsname}=0
+            \dt@spmatch
+          \fi
+          \advance\dtQK by1\relax }%
+        \advance\dtQJ by1\relax }%
+      \message{[wad] sprites: \the\dtQG\space pictures for
+        \the\dtQN\space things}%
+    \fi
+  \fi}
+%% A lump name is eight bytes: four of name, then frame and rotation, then a
+%% second frame and rotation when one picture serves two views mirrored.  One
+%% dump, split into those three pieces, is cheaper than three dumps.
+\def\dt@nmsplit#1#2#3#4#5#6#7#8#9{%
+  \edef\dt@nA{#1#2#3#4#5#6#7#8}\dt@nmsplitB{#9}}
+\def\dt@nmsplitB#1#2#3#4#5#6#7#8{%
+  \edef\dt@nB{#1#2#3#4}\edef\dt@nC{#5#6#7#8}}
+\def\dt@spmatch{%
+  \expandafter\dt@sprot\dt@nB{0}%
+  \expandafter\dt@sprot\dt@nC{1}}
+%% #1#2 is the frame byte and #3#4 the rotation byte.  Rotation characters are
+%% '0' to '8', hex 30 to 38, so #4 IS the rotation digit and needs no
+%% decoding.  #5 says whether this slot is the mirrored one.
+\def\dt@sprot#1#2#3#4#5{%
+  \ifnum\pdfstrcmp{#1#2}{\csname dtWR\the\dtQK\endcsname}=0
+    \dt@sptake{#4}{#5}%
+  \fi}
+\def\dt@sptake#1#2{%
+  \advance\dtQG by1
+  \dtLPOS=\dtL{\number\numexpr\dtDIR+16*\dtQJ\relax}\relax
+  \edef\dt@next{\noexpand\dt@readpic
+    {\csname dtWK\the\dtQK\endcsname#1}{#2}}%
+  \dt@next}
+
+%%% Doom's picture format: width, height, leftoffset and topoffset as int16,
+%%% then one int32 column offset per column, then per column a chain of posts
+%%% -- topdelta, length, a pad byte, `length' pixel bytes, a pad byte --
+%%% ending at topdelta 255.
+%%%
+%%% A post's pixels are ONE \pdffiledump and are stored exactly as they come
+%%% out of the file.  Reading this a byte at a time would be one file dump per
+%%% pixel, which is the difference between a fraction of a second and minutes.
+\def\dt@readpic#1#2{%
+  \ifnum#2=1 \expandafter\gdef\csname dtPf#1\endcsname{1}\fi
+  \dtQW=\dtS{\the\dtLPOS}\relax
+  \dtQH=\dtS{\number\numexpr\dtLPOS+2\relax}\relax
+  \expandafter\xdef\csname dtPw#1\endcsname{\the\dtQW}%
+  \expandafter\xdef\csname dtPh#1\endcsname{\the\dtQH}%
+  \expandafter\xdef\csname dtPl#1\endcsname
+    {\dtS{\number\numexpr\dtLPOS+4\relax}}%
+  \expandafter\xdef\csname dtPt#1\endcsname
+    {\dtS{\number\numexpr\dtLPOS+6\relax}}%
+  \dtQC=0
+  \dtWhile{\dtQC<\dtQW}{%
+    \dtQP=\numexpr\dtLPOS+\dtL{\number\numexpr\dtLPOS+8+4*\dtQC\relax}\relax
+    \gdef\dt@post{}%
+    \dtQT=0
+    \dt@readposts
+    \expandafter\xdef\csname dtQ#1@\the\dtQC\endcsname{\dt@post{-1}{0}{}}%
+    \advance\dtQC by1\relax }}
+
+%% \dtQT doubles as the post counter: a column of a real picture has one or
+%% two posts, and the bound is only there so that a bad column offset cannot
+%% spin forever.  The recursion is not tail recursion, but it is bounded by
+%% that same 64 and costs nothing.
+\def\dt@readposts{%
+  \dtQD=\dtBy{\the\dtQP}\relax
+  \ifnum\dtQD<255
+    \advance\dtQT by1
+    \dtQL=\dtBy{\number\numexpr\dtQP+1\relax}\relax
+    \ifnum\dtQL>0
+      \xdef\dt@post{\dt@post{\the\dtQD}{\the\dtQL}%
+        {\pdffiledump offset \number\numexpr\dtQP+3\relax\space
+         length \the\dtQL\space{\dtWADFILE}}}%
+    \fi
+    \dtQP=\numexpr\dtQP+4+\dtQL\relax
+    \ifnum\dtQT<64 \dt@readposts \fi
+  \fi}
+
+%%% Pictures that are not sprites: no S_START range to narrow the search to,
+%%% and no frame or rotation in the name.  The status bar needs some seventy
+%%% of them -- digits in two fonts, a percent sign, the faces, the arms panel
+%%% and the keys -- and finding each with a \dtFindLump of its own would be
+%%% seventy scans of a 2928-entry directory, at one file dump per entry:
+%%% some 200000 dumps against the 6000 the entire map load costs.  So this is
+%%% the \dt@wantpatches shape again, and for exactly the same reason: mark
+%%% the names, then walk the directory ONCE.
+%%%
+%%% dtGq<namehex> holds the name as it was asked for, so the pass has a key
+%%% to store the picture under -- it is reading hex out of the file, not the
+%%% ASCII the caller used.
+\newcount\dtGN \dtGN=0
+\def\dtWantGfx#1{%
+  \dtNameHex{#1}%
+  \expandafter\gdef\csname dtGq\dt@target\endcsname{#1}}
+\def\dtLoadGfxAll{%
+  \dtQJ=0
+  \dtWhile{\dtQJ<\dtNUML}{%
+    \dtReadName{\number\numexpr\dtDIR+16*\dtQJ+8\relax}%
+    \ifcsname dtGq\dt@tnm\endcsname
+      \dtLPOS=\dtL{\number\numexpr\dtDIR+16*\dtQJ\relax}\relax
+      %% \dt@readpic's key must arrive as literal characters: a macro's
+      %% arguments are not expanded while being grabbed, so the \csname
+      %% itself would become the key and every lookup below would miss.
+      \edef\dt@next{\noexpand\dt@readpic{\csname dtGq\dt@tnm\endcsname}{0}}%
+      \dt@next
+      \advance\dtGN by1
+    \fi
+    \advance\dtQJ by1\relax }}
+
+%%% What the bar is made of.  Ten tall digits, a percent sign, five pain
+%%% levels of three glances each, and the corpse face.  Written as loops
+%%% rather than as thirty-one \dtWantGfx lines because the names really are
+%%% derived -- and built through an \edef with the macro \noexpand'd, since
+%%% \dtWantGfx walks its argument character by character and would otherwise
+%%% be handed \the itself.
+\def\dt@wanthud{%
+  \dtWantGfx{STBAR}\dtWantGfx{STTPRCNT}\dtWantGfx{STFDEAD0}%
+  \dtWantGfx{STFGOD0}%
+  \dtQJ=0
+  \dtWhile{\dtQJ<10}{%
+    \edef\dt@next{\noexpand\dtWantGfx{STTNUM\the\dtQJ}}\dt@next
+    \advance\dtQJ by1\relax }%
+  \dtQJ=0
+  \dtWhile{\dtQJ<5}{%
+    \dtQK=0
+    \dtWhile{\dtQK<3}{%
+      \edef\dt@next{\noexpand\dtWantGfx{STFST\the\dtQJ\the\dtQK}}\dt@next
+      \advance\dtQK by1\relax }%
+    %% The four faces that only damage can reach: the two turns toward
+    %% whatever hit you, the ouch, the evil grin at a new weapon and the
+    %% rampage.  Five more per pain level, and they go through the same
+    %% single directory pass -- a lookup each would be twenty more scans of
+    %% a 2928-entry lump directory.
+    \edef\dt@next{\noexpand\dtWantGfx{STFTL\the\dtQJ0}}\dt@next
+    \edef\dt@next{\noexpand\dtWantGfx{STFTR\the\dtQJ0}}\dt@next
+    \edef\dt@next{\noexpand\dtWantGfx{STFOUCH\the\dtQJ}}\dt@next
+    \edef\dt@next{\noexpand\dtWantGfx{STFEVL\the\dtQJ}}\dt@next
+    \edef\dt@next{\noexpand\dtWantGfx{STFKILL\the\dtQJ}}\dt@next
+    \advance\dtQJ by1\relax }%
+  %% The rest of the bar: the arms panel and its six numbers in two fonts,
+  %% the three key icons, and the small digits the ammunition boxes are drawn
+  %% from.  Twenty-two more pictures, and every one of them rides the same
+  %% single pass over the directory -- a lookup each would be twenty-two
+  %% more scans of 2928 entries.
+  \dtWantGfx{STARMS}%
+  \dtQJ=0
+  \dtWhile{\dtQJ<3}{%
+    \edef\dt@next{\noexpand\dtWantGfx{STKEYS\the\dtQJ}}\dt@next
+    \advance\dtQJ by1\relax }%
+  \dtQJ=0
+  \dtWhile{\dtQJ<10}{%
+    \edef\dt@next{\noexpand\dtWantGfx{STYSNUM\the\dtQJ}}\dt@next
+    \advance\dtQJ by1\relax }%
+  \dtQJ=2
+  \dtWhile{\dtQJ<8}{%
+    \edef\dt@next{\noexpand\dtWantGfx{STGNUM\the\dtQJ}}\dt@next
+    \advance\dtQJ by1\relax }}
+
+%%% ===============================================================  TEXTURES
+%%% A Doom wall texture is not a picture: it is a recipe.  TEXTURE1 gives a
+%%% size and a list of patches with offsets, PNAMES turns a patch number into
+%%% a lump name, and the patch itself is the same column/post format
+%%% \dt@readpic already reads for sprites.  Compositing once at load into
+%%% dtX<t>@<u>@<v> gives the renderer a flat array to sample, so nothing in
+%%% the inner loop has to know any of this.
+%%%
+%%% Only the textures this map's sidedefs actually name are built -- MAP01
+%%% names 39 of the IWAD's 428 -- and their patches are resolved in ONE pass
+%%% over the directory, for the same reason the sprite loader does it that
+%%% way: \dtFindLump scans from a given entry and this WAD has 2928 of them.
+\newcount\NTEX \NTEX=0
+\newcount\dtXJ \newcount\dtXK \newcount\dtXN \newcount\dtXT
+\newcount\dtXU \newcount\dtXV \newcount\dtXZ
+\newcount\dtXW \newcount\dtXH \newcount\dtXA \newcount\dtXB
+\newcount\dtXC \newcount\dtXD \newcount\dtXL
+\newcount\dtXQ \newcount\dtXR \newcount\dtXOX \newcount\dtXOY
+\newcount\dtXPI \newcount\dtXPC \newcount\dtXPW \newcount\dt@ub
+\newcount\dtXNP \newcount\dtXMISS
+
+%%% Lump and texture names are compared uppercased.  Doom does the same, and
+%%% it is not a formality: MAP01's sidedefs name `doortrak' and `support2' in
+%%% lower case while TEXTURE1 spells both in upper.  Matching raw bytes drops
+%%% exactly those two textures and leaves holes in the map.
+\def\dtUpHex{\gdef\dt@tnm{}\dt@uphA}
+\def\dt@uphA#1#2{\ifx\relax#1\else
+  \dt@ub=\numexpr\dtB{#1}{#2}\relax
+  \ifnum\dt@ub>96 \ifnum\dt@ub<123 \advance\dt@ub by-32 \fi\fi
+  \xdef\dt@tnm{\dt@tnm\hx{\the\dt@ub}}%
+  \expandafter\dt@uphA\fi}
+%% \dt@tnm holds a name; is it a real one?  A sidedef with no texture on a
+%% surface spells it `-', and an unused slot is eight NULs.
+\newif\ifdt@hastex
+\def\dt@tfirst#1#2#3\relax{\def\dt@tf{#1#2}}
+\def\dt@testname{\expandafter\dt@tfirst\dt@tnm\relax
+  \dt@hastextrue
+  \ifnum\pdfstrcmp{\dt@tf}{2D}=0 \dt@hastexfalse\fi
+  \ifnum\pdfstrcmp{\dt@tf}{00}=0 \dt@hastexfalse\fi}
+
+%%% Read the 8-byte name at offset #1 and normalise it into \dt@tnm.
+\def\dtReadName#1{%
+  \edef\dt@rnm{\pdffiledump offset #1 length 8 {\dtWADFILE}}%
+  \expandafter\dtUpHex\dt@rnm\relax\relax}
+
+%%% \dtWantTex : \dt@tnm names a texture this map uses.  Leaves its index in
+%%% \dtXN, allocating one on first sight.  The index is handed out before the
+%%% texture is known to exist; an unresolved one keeps width 0 and reads as
+%%% absent, so a sidedef naming a texture the WAD does not have simply falls
+%%% back to the procedural table rather than failing the load.
+\def\dtWantTex{%
+  \ifcsname dtXi\dt@tnm\endcsname\else
+    \expandafter\xdef\csname dtXi\dt@tnm\endcsname{\the\NTEX}%
+    \expandafter\xdef\csname dtXw\the\NTEX\endcsname{0}%
+    \expandafter\xdef\csname dtXh\the\NTEX\endcsname{0}%
+    \global\advance\NTEX by1
+    \dt@swpair
+  \fi
+  \dtXN=\csname dtXi\dt@tnm\endcsname\relax}
+
+%%% ---- switch faces --------------------------------------------------------
+%%% Doom holds the SW1/SW2 pairing in the engine, not in the WAD -- vanilla
+%%% has no SWITCHES lump -- but the pairing it holds is the naming convention
+%%% itself, so it can be recovered from the name.  A texture whose name
+%%% begins SW1 is wanted together with its SW2 twin (and the reverse), and
+%%% the two indices are recorded in dtXs pointing at each other.
+%%%
+%%% Doing it here rather than when the switch is pressed is what makes the
+%%% pressed face exist at all: only the names a sidedef mentions are ever
+%%% composited, and a map naturally mentions only the unpressed one.
+%%%
+%%% The name is already hex, uppercased and NUL-padded to eight bytes, so
+%%% "SW" is the four characters 5357 and the digit is the two after it; the
+%%% counterpart differs in exactly one of the sixteen.  Comparison is
+%%% character by character with \if rather than \ifnum, because a name whose
+%%% hex contains A-F is not a number and \ifnum would raise an error on it
+%%% (`JOINT2' would).  The ZZZZZZ sentinel makes the six-argument grab safe
+%%% for a name shorter than three characters; Z is not a hex digit, so the
+%%% tail can be recovered by delimiting on it.
+\def\dt@swpair{%
+  \begingroup
+    \edef\dt@swa{\dt@tnm}%
+    \expandafter\dt@swsplit\dt@tnm ZZZZZZ\relax
+  \endgroup}
+\def\dt@swtail#1ZZZZZZ{#1}
+\def\dt@swsplit#1#2#3#4#5#6#7\relax{%
+  \if#15\if#23\if#35\if#47
+    \if#53
+      \if#61 \dt@swmake{32}{#7}\fi
+      \if#62 \dt@swmake{31}{#7}\fi
+    \fi
+  \fi\fi\fi\fi}
+%%% #1 is the toggled digit as hex, #2 the rest of the name with the sentinel
+%%% still on it.  \dtWantTex recurses back into \dt@swpair for the twin, but
+%%% only on the branch that allocates, so the twin's own pairing finds this
+%%% name already present and the recursion stops one level down.
+\def\dt@swmake#1#2{%
+  \edef\dt@tnm{5357#1\dt@swtail#2}%
+  \dtWantTex
+  \expandafter\xdef\csname dtXs\csname dtXi\dt@swa\endcsname\endcsname
+    {\the\dtXN}%
+  \expandafter\xdef\csname dtXs\the\dtXN\endcsname
+    {\csname dtXi\dt@swa\endcsname}}
+%% -1 when the name is `-' or empty, which is what \dtAddSide stores.
+\def\dtTexRef#1{\dtReadName{#1}\dt@testname
+  \ifdt@hastex \dtWantTex \else \dtXN=-1 \fi}
+%% Want a texture by its literal name rather than by a name in the file.
+%% \dtNameHex does not fold case, so the argument must already be upper.
+\def\dtWantTexName#1{\dtNameHex{#1}\edef\dt@tnm{\dt@target}\dtWantTex}
+
+%%% ---- PNAMES: a count, then one 8-byte patch name each --------------------
+\def\dt@loadpnames{%
+  \dtXNP=0
+  \dtFindLump{PNAMES}{0}%
+  \ifnum\dtFOUND<0
+    \message{[wad] no PNAMES -- walls stay on the procedural tables.}%
+  \else
+    \dtXNP=\dtL{\the\dtLPOS}\relax
+    \dtXJ=0
+    \dtWhile{\dtXJ<\dtXNP}{%
+      \dtReadName{\number\numexpr\dtLPOS+4+8*\dtXJ\relax}%
+      \expandafter\xdef\csname dtXp\the\dtXJ\endcsname{\dt@tnm}%
+      \advance\dtXJ by1\relax }%
+  \fi}
+
+%%% ---- TEXTURE1 / TEXTURE2: a count, an offset each, then maptexture_t -----
+%%% maptexture_t is name[8], masked int32, width, height, columndirectory
+%%% int32, patchcount -- 22 bytes -- then patchcount mappatch_t of 10.  Only
+%%% the record's offset is kept here; the patch list is re-read at composite
+%%% time rather than being copied into arrays it would only be read from once.
+\def\dt@scantex#1{%
+  \dtFindLump{#1}{0}%
+  \ifnum\dtFOUND<0\else
+    \dtXA=\dtLPOS
+    \dtXC=\dtL{\the\dtXA}\relax
+    \dtXJ=0
+    \dtWhile{\dtXJ<\dtXC}{%
+      \dtXB=\numexpr\dtXA+\dtL{\number\numexpr\dtXA+4+4*\dtXJ\relax}\relax
+      \dtReadName{\the\dtXB}%
+      \ifcsname dtXi\dt@tnm\endcsname
+        \dtXT=\csname dtXi\dt@tnm\endcsname\relax
+        \ifnum\csname dtXw\the\dtXT\endcsname=0
+          \expandafter\xdef\csname dtXo\the\dtXT\endcsname{\the\dtXB}%
+          \expandafter\xdef\csname dtXw\the\dtXT\endcsname
+            {\dtS{\number\numexpr\dtXB+12\relax}}%
+          \expandafter\xdef\csname dtXh\the\dtXT\endcsname
+            {\dtS{\number\numexpr\dtXB+14\relax}}%
+          %% v wraps at the texture's own height, so precompute the modulus
+          %% the render loop subtracts rather than multiplying per column.
+          \expandafter\xdef\csname dtXm\the\dtXT\endcsname
+            {\number\numexpr\csname dtXh\the\dtXT\endcsname*65536\relax}%
+        \fi
+      \fi
+      \advance\dtXJ by1\relax }%
+  \fi}
+
+%%% ---- which patch lumps are needed, and where they are --------------------
+%%% Mark every patch named by a wanted texture, then walk the directory once.
+\def\dt@wantpatches{%
+  \dtXT=0
+  \dtWhile{\dtXT<\NTEX}{%
+    \ifnum\csname dtXw\the\dtXT\endcsname>0
+      \dtXB=\csname dtXo\the\dtXT\endcsname\relax
+      \dtXC=\dtUu{\number\numexpr\dtXB+20\relax}\relax
+      \dtXJ=0
+      \dtWhile{\dtXJ<\dtXC}{%
+        \dtXPI=\dtUu{\number\numexpr\dtXB+22+10*\dtXJ+4\relax}\relax
+        \ifnum\dtXPI<\dtXNP
+          \expandafter\gdef\csname dtXq\csname dtXp\the\dtXPI\endcsname
+            \endcsname{1}%
+        \fi
+        \advance\dtXJ by1\relax }%
+    \fi
+    \advance\dtXT by1\relax }}
+\def\dt@findpatches{%
+  \dtXJ=0
+  \dtWhile{\dtXJ<\dtNUML}{%
+    \dtReadName{\number\numexpr\dtDIR+16*\dtXJ+8\relax}%
+    \ifcsname dtXq\dt@tnm\endcsname
+      \ifcsname dtXl\dt@tnm\endcsname\else
+        \expandafter\xdef\csname dtXl\dt@tnm\endcsname
+          {\dtL{\number\numexpr\dtDIR+16*\dtXJ\relax}}%
+      \fi
+    \fi
+    \advance\dtXJ by1\relax }}
+
+%%% ---- compositing ---------------------------------------------------------
+%%% A composited texel is stored EIGHT TO A CONTROL SEQUENCE, as
+%%% dtX<t>@<g>@<v> holding the eight texels at u = 8g..8g+7 of row v.
+%%%
+%%% This is not a space nicety, it is the difference between the project
+%%% fitting in pdfTeX and not.  One control sequence per texel is 420k
+%%% strings for MAP01's 39 textures, against a pool of 497k under pdftex and
+%%% 476k under pdflatex -- so the array alone was 92% of the budget and the
+%%% first flat to be loaded killed the run with "TeX capacity exceeded
+%%% [number of strings]".  Packed, the same textures cost 53k.
+%%%
+%%% Eight along u rather than along v because u is FIXED for a whole column
+%%% span: \dt@usetex settles both the group and which of the eight to take
+%%% once per column, so the inner loop pays one extra macro call and no
+%%% arithmetic at all.  Packing along v would have to split the row per pixel.
+%%%
+%%% That in turn forces compositing to run COLUMN MAJOR, in groups of eight,
+%%% because a group needs eight columns of one row at once.  Doom's order is
+%%% patch major -- draw patch 1 everywhere, then patch 2 over it -- so this
+%%% inverts it: for each column every patch that covers it writes into a
+%%% scratch column, later patches overwriting earlier ones, which is the same
+%%% semantics reached from the other side.
+%%%
+%%% The scratch dtZZ<k>@<v> is REDEFINED for every group rather than
+%%% allocated per group.  Redefining a control sequence makes no new string,
+%%% and that is the whole trick: 8 x (h+1) scratch names serve the entire
+%%% texture set.
+\newcount\dtXGG \newcount\dtXGK \newcount\dtXGU \newcount\dtXZE
+
+%% Clearing is what makes a hole read as 00 rather than as the previous
+%% group's pixel, so it replaces \dt@fillholes and its texel counter: those
+%% only ran for the 2 textures of 39 that do not tile exactly, and there is
+%% no equivalent of "did anything write here" once the array is packed.
+\def\dt@zclear{%
+  \dtXGK=0
+  \dtWhile{\dtXGK<8}{%
+    \dtXV=0
+    \dtWhile{\dtXV<\dtXZE}{%
+      \expandafter\gdef\csname dtZZ\the\dtXGK @\the\dtXV\endcsname{00}%
+      \advance\dtXV by1\relax }%
+    \advance\dtXGK by1\relax }}
+
+%% One patch column's posts into scratch column \dtXGK.  A post that lies
+%% wholly inside the texture -- almost all of them -- skips the bounds test
+%% per pixel.  The guarded form still has to consume the clipped characters,
+%% so it cannot simply stop early.
+\def\dt@txrunF#1#2{%
+  \expandafter\xdef\csname dtZZ\the\dtXGK @\the\dtXV\endcsname{#1#2}%
+  \advance\dtXV by1
+  \ifnum\dtXV<\dtXZ \expandafter\dt@txrunF\fi}
+\def\dt@txrunG#1#2{%
+  \ifnum\dtXV>-1 \ifnum\dtXV<\dtXH
+    \expandafter\xdef\csname dtZZ\the\dtXGK @\the\dtXV\endcsname{#1#2}%
+  \fi\fi
+  \advance\dtXV by1
+  \ifnum\dtXV<\dtXZ \expandafter\dt@txrunG\fi}
+\def\dt@txposts{%
+  \dtXD=\dtBy{\the\dtXR}\relax
+  \ifnum\dtXD<255
+    \advance\dtXPC by1
+    \dtXL=\dtBy{\number\numexpr\dtXR+1\relax}\relax
+    \ifnum\dtXL>0
+      \dtXV=\numexpr\dtXOY+\dtXD\relax
+      \dtXZ=\numexpr\dtXV+\dtXL\relax
+      \edef\dt@trun{\pdffiledump offset \number\numexpr\dtXR+3\relax\space
+        length \the\dtXL\space{\dtWADFILE}}%
+      \ifnum\dtXV<0
+        \expandafter\dt@txrunG\dt@trun
+      \else
+        \ifnum\dtXZ>\dtXH
+          \expandafter\dt@txrunG\dt@trun
+        \else
+          \expandafter\dt@txrunF\dt@trun
+        \fi
+      \fi
+    \fi
+    \dtXR=\numexpr\dtXR+4+\dtXL\relax
+    \ifnum\dtXPC<128 \dt@txposts \fi
+  \fi}
+
+%% Every patch that covers texture column \dtXGU, in file order.
+\def\dt@zcolumn{%
+  \dtXJ=0
+  \dtWhile{\dtXJ<\dtXC}{%
+    \dtXA=\numexpr\dtXB+22+10*\dtXJ\relax
+    \dtXOX=\dtS{\the\dtXA}\relax
+    \dtXOY=\dtS{\number\numexpr\dtXA+2\relax}\relax
+    \dtXPI=\dtUu{\number\numexpr\dtXA+4\relax}\relax
+    \ifnum\dtXPI<\dtXNP
+      \edef\dt@pnm{\csname dtXp\the\dtXPI\endcsname}%
+      \ifcsname dtXl\dt@pnm\endcsname
+        \dtXQ=\csname dtXl\dt@pnm\endcsname\relax
+        \dtXPW=\dtS{\the\dtXQ}\relax
+        \dtXK=\numexpr\dtXGU-\dtXOX\relax
+        \ifnum\dtXK>-1 \ifnum\dtXK<\dtXPW
+          \dtXR=\numexpr\dtXQ+\dtL{%
+            \number\numexpr\dtXQ+8+4*\dtXK\relax}\relax
+          \dtXPC=0
+          \dt@txposts
+        \fi\fi
+      \fi
+    \fi
+    \advance\dtXJ by1\relax }}
+
+%% Row h repeats row 0, for the same reason the procedural table has 65 rows:
+%% the span expansion reads v with \numexpr, whose division ROUNDS, so a v
+%% just short of the wrap asks for row h.
+\def\dt@zpack{%
+  \dtXGK=0
+  \dtWhile{\dtXGK<8}{%
+    \expandafter\xdef\csname dtZZ\the\dtXGK @\the\dtXH\endcsname
+      {\csname dtZZ\the\dtXGK @0\endcsname}%
+    \advance\dtXGK by1\relax }%
+  \dtXV=0
+  \dtWhile{\dtXV<\dtXZE}{%
+    \expandafter\xdef\csname dtX\the\dtXT @\the\dtXGG @\the\dtXV\endcsname{%
+      {\csname dtZZ0@\the\dtXV\endcsname}{\csname dtZZ1@\the\dtXV\endcsname}%
+      {\csname dtZZ2@\the\dtXV\endcsname}{\csname dtZZ3@\the\dtXV\endcsname}%
+      {\csname dtZZ4@\the\dtXV\endcsname}{\csname dtZZ5@\the\dtXV\endcsname}%
+      {\csname dtZZ6@\the\dtXV\endcsname}{\csname dtZZ7@\the\dtXV\endcsname}}%
+    \advance\dtXV by1\relax }}
+
+\def\dt@compose{%
+  \dtXW=\csname dtXw\the\dtXT\endcsname\relax
+  \dtXH=\csname dtXh\the\dtXT\endcsname\relax
+  \dtXB=\csname dtXo\the\dtXT\endcsname\relax
+  \dtXC=\dtUu{\number\numexpr\dtXB+20\relax}\relax
+  \dtXZE=\numexpr\dtXH+1\relax
+  \dtXGG=0
+  \dtWhile{\numexpr\dtXGG*8\relax<\dtXW}{%
+    \dt@zclear
+    \dtXGK=0
+    \dtWhile{\dtXGK<8}{%
+      \dtXGU=\numexpr\dtXGG*8+\dtXGK\relax
+      \ifnum\dtXGU<\dtXW \dt@zcolumn \fi
+      \advance\dtXGK by1\relax }%
+    \dt@zpack
+    \advance\dtXGG by1\relax }}
+
+%%% ---- masked middles (M19) ------------------------------------------------
+%%% A middle texture on a TWO-SIDED line is the one surface in Doom that is
+%%% drawn with its holes: the room beyond shows through the bars.  \dt@compose
+%%% above cannot serve it, and not by oversight -- \dt@zclear fills every
+%%% untouched texel with palette 0 precisely so that an undefined one cannot
+%%% raise `Missing \endcsname' in the inner loop, and that is exactly the
+%%% information transparency needs.
+%%%
+%%% So those textures keep their PATCH's post chain as well as the composite,
+%%% under the picture key MK<t>, and the sprite pass draws them -- \dtSprRun
+%%% already walks posts, already resamples source driven and already splices
+%%% one band per post.  The feature needs no new inner loop at all.
+%%%
+%%% Which textures: marked here rather than at \dtTexRef, because "two-sided"
+%%% is a property of the LINE and a sidedef does not know what it is attached
+%%% to.  This runs after LINEDEFS, which is why \dtLoadTextures is where it
+%%% is called from.
+\newcount\dtXMK \newcount\dtXNM \dtXNM=0
+\def\dt@markmasked{%
+  \dtXMK=0
+  \dtWhile{\dtXMK<\NLINE}{%
+    \ifcsname dtLB\the\dtXMK\endcsname
+      \ifnum\csname dtLB\the\dtXMK\endcsname<0 \else
+      \ifnum\csname dtLF\the\dtXMK\endcsname<0 \else
+        \dt@markmaskside{dtLR\the\dtXMK}%
+        \dt@markmaskside{dtLL\the\dtXMK}%
+      \fi\fi
+    \fi
+    \advance\dtXMK by1\relax }}
+\def\dt@markmaskside#1{%
+  \ifcsname #1\endcsname
+    \ifnum\csname #1\endcsname<0 \else
+      \edef\dt@mkt{\csname dtYm\csname #1\endcsname\endcsname}%
+      \ifnum\dt@mkt<0 \else
+        \expandafter\gdef\csname dtXk\dt@mkt\endcsname{1}%
+      \fi
+    \fi
+  \fi}
+
+%%% Two ways to get them.  A texture that is ONE patch at (0,0) -- which is
+%%% every masked middle with a hole in it that the commercial maps use;
+%%% MAP01's two are MIDBARS3 out of RW45_1 and BRNSMAL1 out of W111_2 -- has
+%%% its posts already, in the patch, and \dt@readpic takes them as they are.
+%%%
+%%% Anything else is built (M23).  Doom itself gives up here:
+%%% R_GenerateComposite keeps posts only for a column a single patch covers
+%%% and draws the rest as garbage, which is the "medusa" every mapper learns
+%%% to avoid.  There is no reason to copy that.  Each column goes through
+%%% \dt@zcolumn exactly as the opaque composite did -- every patch that
+%%% covers it, later ones over earlier -- but into a scratch column cleared
+%%% to a marker instead of to palette 0, and the rows between markers are
+%%% gathered back into posts.  Doom II names three such middles (PIPE4,
+%%% SKSPINE2 and TEKBRON1, each two patches side by side), and until this
+%%% they were not drawn at all.
+%%%
+%%% \dt@compose has just run for this texture, so \dtXW, \dtXH, \dtXB and
+%%% \dtXC are already its own.  A patch narrower or shorter than the texture
+%%% is fine either way: where nothing was drawn there is no post, which
+%%% reads as transparent.
+\newif\ifdt@mkone
+\newcount\dtXMU \newcount\dtXMV \newcount\dtXMS
+\def\dt@maskread{%
+  \dt@mkonefalse
+  \ifnum\dtXC=1
+    \dtXA=\numexpr\dtXB+22\relax
+    \dtXOX=\dtS{\the\dtXA}\relax
+    \dtXOY=\dtS{\number\numexpr\dtXA+2\relax}\relax
+    \ifnum\dtXOX=0 \ifnum\dtXOY=0
+      \dtXPI=\dtUu{\number\numexpr\dtXA+4\relax}\relax
+      \ifnum\dtXPI<\dtXNP
+        \edef\dt@pnm{\csname dtXp\the\dtXPI\endcsname}%
+        \ifcsname dtXl\dt@pnm\endcsname
+          \dtLPOS=\csname dtXl\dt@pnm\endcsname\relax
+          \edef\dt@next{\noexpand\dt@readpic{MK\the\dtXT}{0}}\dt@next
+          \dt@mkonetrue
+        \fi
+      \fi
+    \fi\fi
+  \fi
+  \ifdt@mkone\else \dt@maskbuild \fi
+  \expandafter\gdef\csname dtXn\the\dtXT\endcsname{1}%
+  \global\advance\dtXNM by1 }
+
+%% The marker is two characters that are not hex, so no pixel can be
+%% mistaken for it; \ifx compares the two macros' bodies and both were typed
+%% in this file, so the catcodes agree.  \dtXV belongs to \dt@txposts, which
+%% \dt@zcolumn runs, so the gathering walk has a counter of its own.
+\def\dt@mkhole{--}
+\def\dt@maskbuild{%
+  \expandafter\xdef\csname dtPwMK\the\dtXT\endcsname{\the\dtXW}%
+  \expandafter\xdef\csname dtPhMK\the\dtXT\endcsname{\the\dtXH}%
+  \expandafter\gdef\csname dtPlMK\the\dtXT\endcsname{0}%
+  \expandafter\gdef\csname dtPtMK\the\dtXT\endcsname{0}%
+  \dtXMU=0
+  \dtWhile{\dtXMU<\dtXW}{%
+    \dtXV=0
+    \dtWhile{\dtXV<\dtXH}{%
+      \expandafter\gdef\csname dtZZ0@\the\dtXV\endcsname{--}%
+      \advance\dtXV by1\relax }%
+    \dtXGK=0 \dtXGU=\dtXMU
+    \dt@zcolumn
+    \gdef\dt@post{}\gdef\dt@mrun{}%
+    \dtXMS=-1 \dtXMV=0
+    \dtWhile{\dtXMV<\dtXH}{%
+      \edef\dt@mpx{\csname dtZZ0@\the\dtXMV\endcsname}%
+      \ifx\dt@mpx\dt@mkhole
+        \dt@maskflush
+      \else
+        \ifnum\dtXMS<0 \dtXMS=\dtXMV \fi
+        \xdef\dt@mrun{\dt@mrun\dt@mpx}%
+      \fi
+      \advance\dtXMV by1\relax }%
+    \dt@maskflush
+    \expandafter\xdef\csname dtQMK\the\dtXT @\the\dtXMU\endcsname
+      {\dt@post{-1}{0}{}}%
+    \advance\dtXMU by1\relax }}
+%% One run of drawn rows becomes one post, in \dt@readpic's own shape.
+\def\dt@maskflush{%
+  \ifnum\dtXMS<0 \else
+    \xdef\dt@post{\dt@post{\the\dtXMS}{\number\numexpr\dtXMV-\dtXMS\relax}%
+      {\dt@mrun}}%
+    \gdef\dt@mrun{}\dtXMS=-1
+  \fi}
+
+%%% Diagnostic: put a texture that is already loaded through \dt@maskbuild,
+%%% whichever way its posts were first got.  The commercial maps name no
+%%% texture that is both several patches AND full of holes, so the only way
+%%% to watch the builder find a hole is to hand it MIDBARS3 -- whose posts
+%%% the patch has already supplied -- and require the same picture back.
+\def\dtMaskRebuild#1{%
+  \dtNameHex{#1}%
+  \ifcsname dtXi\dt@target\endcsname
+    \dtXT=\csname dtXi\dt@target\endcsname\relax
+    \ifnum\csname dtXw\the\dtXT\endcsname>0
+      \dtXW=\csname dtXw\the\dtXT\endcsname\relax
+      \dtXH=\csname dtXh\the\dtXT\endcsname\relax
+      \dtXB=\csname dtXo\the\dtXT\endcsname\relax
+      \dtXC=\dtUu{\number\numexpr\dtXB+20\relax}\relax
+      \dt@maskbuild
+      \message{[maskrebuild] #1 \the\dtXW x\the\dtXH}%
+    \fi
+  \fi}
+
+%%% Diagnostic: one column of a masked middle's posts, so a harness can build
+%%% the same column from the WAD and compare -- \dtTexRow's argument, for the
+%%% one array \dtTexRow cannot see.
+\def\dtMaskCol#1#2{%
+  \dtNameHex{#1}%
+  \ifcsname dtXi\dt@target\endcsname
+    \dtXT=\csname dtXi\dt@target\endcsname\relax
+    \ifcsname dtQMK\the\dtXT @#2\endcsname
+      \message{[maskcol] #1 #2 \csname dtQMK\the\dtXT @#2\endcsname}%
+    \else
+      \message{[maskcol] #1 #2 opaque}%
+    \fi
+  \else
+    \message{[maskcol] #1 #2 missing}%
+  \fi}
+
+%%% Diagnostic: print one row of a composited texture as hex bytes, so that a
+%%% harness can composite the same texture by its own route and compare.  It
+%%% is the only way to check the composite itself rather than its effect --
+%%% a wrong PNAMES index, a patch placed at the wrong origin, a post decoded
+%%% one byte out or a hole filled that should have been painted all produce a
+%%% picture that renders perfectly well and is simply not the right one.
+%%%
+%%% One \message, not one per column: pdfTeX hard-wraps terminal output at
+%%% max_print_line without inserting or dropping characters, so a single
+%%% string survives deleting the newlines while separate messages would have
+%%% spaces between them.
+\def\dtTexRow#1#2{%
+  \dtNameHex{#1}%
+  \ifcsname dtXi\dt@target\endcsname
+    \dtXT=\csname dtXi\dt@target\endcsname\relax
+    \dtXW=\csname dtXw\the\dtXT\endcsname\relax
+    \dtXH=\csname dtXh\the\dtXT\endcsname\relax
+    %% Sampled one texel at a time THROUGH \dt@pick, the same way \WallTex
+    %% reaches a texel, rather than by taking whole groups.  Taking groups
+    %% would be shorter and would leave the pick -- the half of the packing
+    %% that runs per column -- with nothing checking it at all: a \dt@usetex
+    %% that always chose the first of the eight would draw every wall as
+    %% eight-fold vertical stripes and pass every check in this file.
+    \gdef\dt@row{}%
+    \dtXU=0
+    \dtWhile{\dtXU<\dtXW}{%
+      %% Through \dt@usetex, not by splitting u here.  Working out the group
+      %% and the pick independently would check the STORAGE and leave the
+      %% half of the packing that runs per column unguarded: a \dt@usetex
+      %% that always chose the first texel of the eight draws every wall as
+      %% eight-fold vertical stripes and passes every render check in
+      %% check.py.  Confirmed by making it do exactly that.
+      %% \rd is the u \dt@usetex wraps, \vstepr the step \dt@vsetup reduces.
+      \rd=\dtXU \vstepr=65536
+      \dt@usetex{\the\dtXT}%
+      \xdef\dt@row{\dt@row
+        \expandafter\expandafter\expandafter\dt@pick
+          \csname\dt@ux#2\endcsname}%
+      \advance\dtXU by1\relax }%
+    \message{[texrow] #1 #2 \the\dtXW\space\the\dtXH\space\dt@row}%
+  \else
+    \message{[texrow] #1 #2 missing}%
+  \fi}
+
+%%% ==================================================================  FLATS
+%%% A flat is the one Doom graphic that is not a picture and not a recipe:
+%%% 4096 raw bytes, 64 rows of 64, no posts, no offsets, no PNAMES.  So the
+%%% loader is a fraction of \dtLoadTextures -- the only thing it borrows is
+%%% the shape, resolving every wanted name in ONE pass over the directory
+%%% between the F_START and F_END markers rather than a \dtFindLump each.
+%%%
+%%% Stored as dtFL<t>@<v>@<g>, a row v split into eight groups of eight
+%%% texels, indexed [row][column] because that is how the span arithmetic
+%%% arrives: Doom's R_DrawSpan reads
+%%% source[((yfrac>>10)&4032) + ((xfrac>>16)&63)], i.e. world y picks the row
+%%% and world x the column.  Getting that pair the wrong way round transposes
+%%% every floor in the map, which on a symmetric flat like FLOOR4_8 is
+%%% invisible -- see check.py's asymmetric-flat probe.
+%%%
+%%% Eight to a control sequence rather than one, because THE STRING POOL IS
+%%% THE BINDING RESOURCE HERE.  39 composited wall textures already hold
+%%% ~457k of pdfTeX's 497k strings; a texel each would want 127k more and the
+%%% load dies with "TeX capacity exceeded [number of strings]" halfway
+%%% through the second flat.  Packing costs an eight-argument grab per pixel
+%%% and spends `words of memory', which this build has 2.8M of going spare.
+%%% Anything that adds a per-texel array from here on has the same problem
+%%% and the same answer.
+\newcount\NFLAT \NFLAT=0
+\newcount\dtFN \newcount\dtFT \newcount\dtFU \newcount\dtFV
+\newcount\dtFJ \newcount\dtFB \newcount\dtFE \newcount\dtFP
+\newcount\dtFMISS \newcount\dtHASSKY \dtHASSKY=0
+
+%%% F_SKY1 is not a flat.  It is the marker Doom uses to say "this plane is
+%%% the sky", and its 4096 bytes are never drawn -- drawing them gives a
+%%% ceiling of red rock that stretches to infinity at the horizon.  Ten of
+%%% MAP01's 59 sectors name it, so this is not an edge case.
+%% \dtNameHex walks its argument a character at a time and does not expand
+%% it, so the name has to be written out here rather than kept in a macro.
+\dtNameHex{F_SKY1}\edef\dt@skyhex{\dt@target}
+
+%%% \dtWantFlat : \dt@tnm names a flat this map uses.  Same contract as
+%%% \dtWantTex -- the index is handed out before the lump is known to exist,
+%%% and dtFw stays 0 until the F_START pass actually reads one, so a sector
+%%% naming a flat the WAD has not got falls back to its procedural ramp
+%%% instead of failing the load.
+\def\dtWantFlat{%
+  \ifcsname dtFi\dt@tnm\endcsname\else
+    \expandafter\xdef\csname dtFi\dt@tnm\endcsname{\the\NFLAT}%
+    \expandafter\xdef\csname dtFw\the\NFLAT\endcsname{0}%
+    \global\advance\NFLAT by1
+  \fi
+  \dtFN=\csname dtFi\dt@tnm\endcsname\relax}
+
+%% -1 when the name is absent, -2 when it is the sky.
+\def\dtFlatRef#1{\dtReadName{#1}\dt@testname
+  \ifdt@hastex
+    \ifnum\pdfstrcmp{\dt@tnm}{\dt@skyhex}=0
+      \dtFN=-2 \global\dtHASSKY=1
+    \else \dtWantFlat \fi
+  \else \dtFN=-1 \fi}
+
+%%% One row of 64 bytes is ONE \pdffiledump, split into eight groups of eight
+%%% here.  The per-pixel alternative would be 4096 file dumps a flat.  Two
+%%% stages because a macro takes nine arguments and a group is sixteen
+%%% characters; between them they consume the row exactly.
+\def\dt@flrunA#1#2#3#4#5#6#7#8{%
+  \def\dt@fgrp{{#1#2}{#3#4}{#5#6}{#7#8}}\dt@flrunB}
+\def\dt@flrunB#1#2#3#4#5#6#7#8{%
+  \expandafter\xdef\csname dtFL\the\dtFT @\the\dtFV @\the\dtFU\endcsname
+    {\dt@fgrp{#1#2}{#3#4}{#5#6}{#7#8}}%
+  \advance\dtFU by1
+  \ifnum\dtFU<8 \expandafter\dt@flrunA\fi}
+\def\dt@readflat{%
+  \dtFV=0
+  \dtWhile{\dtFV<64}{%
+    \edef\dt@frow{\pdffiledump offset
+      \number\numexpr\dtFP+64*\dtFV\relax\space length 64 {\dtWADFILE}}%
+    \dtFU=0
+    \expandafter\dt@flrunA\dt@frow
+    \advance\dtFV by1\relax }}
+
+%%% Diagnostic: print one row of a loaded flat as hex bytes, so a harness can
+%%% read the same 64 bytes out of the WAD itself and compare.  Same reasoning
+%%% as \dtTexRow -- a flat that is transposed, off by a row, or read from the
+%%% wrong lump renders perfectly plausibly and is simply not the right one.
+%%% One \message, because pdfTeX hard-wraps terminal output mid-token.
+\def\dtFlatRow#1#2{%
+  \dtNameHex{#1}%
+  \ifcsname dtFi\dt@target\endcsname
+    \dtFT=\csname dtFi\dt@target\endcsname\relax
+    \gdef\dt@frw{}%
+    \dtFU=0
+    \dtWhile{\dtFU<8}{%
+      \xdef\dt@frw{\dt@frw\csname dtFL\the\dtFT @#2@\the\dtFU\endcsname}%
+      \advance\dtFU by1\relax }%
+    \message{[flatrow] #1 #2 \dt@frw}%
+  \else
+    \message{[flatrow] #1 #2 missing}%
+  \fi}
+
+\def\dtLoadFlats{%
+  %% \DTNOTEX means "keep every surface on the procedural shade tables", and
+  %% the palette-ramp invariant in INTERNALS section 6 is stated about exactly
+  %% that render -- so it has to cover planes too, or the check goes red for
+  %% the right reason and the wrong surface.  \DTNOFLAT turns off only the
+  %% planes, which is what makes a flats-on/flats-off diff possible.
+  \expandafter\ifx\csname DTNOTEX\endcsname\relax\else \global\NFLAT=0 \fi
+  \expandafter\ifx\csname DTNOFLAT\endcsname\relax\else
+    \global\NFLAT=0
+    \message{[wad] \string\DTNOFLAT: planes stay on the procedural ramps}%
+  \fi
+  \ifnum\NFLAT>0
+    \dtFindLump{F_START}{0}%
+    \ifnum\dtFOUND<0
+      \message{[wad] no F_START -- planes stay on the procedural ramps.}%
+      \global\NFLAT=0
+    \else
+      \dtFB=\dtFOUND
+      \dtFE=\dtNUML
+      \dtFindLump{F_END}{\the\dtFB}%
+      \ifnum\dtFOUND<0\else \dtFE=\dtFOUND \fi
+      \dtFJ=\numexpr\dtFB+1\relax
+      \dtWhile{\dtFJ<\dtFE}{%
+        \dtReadName{\number\numexpr\dtDIR+16*\dtFJ+8\relax}%
+        \ifcsname dtFi\dt@tnm\endcsname
+          \ifnum\csname dtFw\csname dtFi\dt@tnm\endcsname\endcsname=0
+            \dtFT=\csname dtFi\dt@tnm\endcsname\relax
+            \dtFP=\dtL{\number\numexpr\dtDIR+16*\dtFJ\relax}\relax
+            \ifnum\dtL{\number\numexpr\dtDIR+16*\dtFJ+4\relax}<4096 \else
+              \dt@readflat
+              \expandafter\xdef\csname dtFw\the\dtFT\endcsname{1}%
+            \fi
+          \fi
+        \fi
+        \advance\dtFJ by1\relax }%
+      \dtFMISS=0
+      \dtFT=0
+      \dtWhile{\dtFT<\NFLAT}{%
+        \ifnum\csname dtFw\the\dtFT\endcsname=0 \advance\dtFMISS by1 \fi
+        \advance\dtFT by1\relax }%
+      \message{[wad] flats: \number\numexpr\NFLAT-\dtFMISS\relax\space read
+        of \the\NFLAT\space named%
+        \ifnum\dtFMISS>0 , \the\dtFMISS\space not between F_START and F_END\fi
+        \ifnum\dtHASSKY>0 ; sky planes present\fi}%
+    \fi
+  \fi}
+
+\def\dtLoadTextures{%
+  %% \DTNOTEX keeps the walls on the procedural shade tables even with a real
+  %% IWAD loaded.  check.py needs it: two of its oldest invariants are about
+  %% how *procedurally shaded* surfaces behave, and neither can be stated
+  %% about a wall carrying whatever colours the artist used.
+  \expandafter\ifx\csname DTNOTEX\endcsname\relax\else
+    \global\NTEX=0
+    \message{[wad] \string\DTNOTEX: walls stay on the procedural tables}%
+  \fi
+  %% The sky is a wall texture, not a flat: Doom draws it as a vertical strip
+  %% indexed by view angle, so it has to join the want list before TEXTURE1 is
+  %% scanned.  Which one it is depends on the map -- Doom II uses SKY1 for
+  %% MAP01-11, SKY2 for 12-20, SKY3 above that -- so \DTSKY overrides it.
+  \expandafter\ifx\csname DTNOFLAT\endcsname\relax\else \global\dtHASSKY=0 \fi
+  %% It composites like any other texture -- which it can only afford to do
+  %% because dtX is packed: a 256x128 sky is 33k texels, and unpacked that is
+  %% more than the whole string pool had spare.
+  \ifnum\dtHASSKY>0 \ifnum\NTEX>0
+    \expandafter\ifx\csname DTSKY\endcsname\relax\def\DTSKY{SKY1}\fi
+    \expandafter\dtWantTexName\expandafter{\DTSKY}%
+    \global\dtSKYT=\dtXN
+  \fi\fi
+  \ifnum\NTEX>0
+    \dt@loadpnames
+    \ifnum\dtXNP>0
+      \dt@scantex{TEXTURE1}%
+      \dt@scantex{TEXTURE2}%
+      \dt@wantpatches
+      \dt@findpatches
+      %% Before the compose loop, because \dt@maskread runs inside it and
+      %% needs to know which textures were asked for as masked middles.
+      %% \DTNOMASK keeps every middle opaque, which is the world M18 left.
+      \expandafter\ifx\csname DTNOMASK\endcsname\relax \dt@markmasked \fi
+      \dtXMISS=0
+      \dtXT=0
+      \dtWhile{\dtXT<\NTEX}{%
+        \ifnum\csname dtXw\the\dtXT\endcsname>0
+          \dt@compose
+          \ifcsname dtXk\the\dtXT\endcsname \dt@maskread \fi
+        \else
+          \advance\dtXMISS by1
+        \fi
+        \advance\dtXT by1\relax }%
+      \message{[wad] textures: \number\numexpr\NTEX-\dtXMISS\relax\space
+        composited of \the\NTEX\space named%
+        \ifnum\dtXMISS>0 , \the\dtXMISS\space not in TEXTURE1\fi
+        \ifnum\dtXNM>0 ; \the\dtXNM\space kept as masked middles\fi}%
+    \fi
+  \fi}
+
+%%% ------------------------------------------------------------- main loader
+\newcount\dtNV \newcount\dtNSD \newcount\dtNSE \newcount\dtNLD
+\newcount\dtNSG \newcount\dtNSS \newcount\dtNND
+\newcount\dtVP \newcount\dtSDP \newcount\dtSEP \newcount\dtLDP
+\newcount\dtSGP \newcount\dtSSP \newcount\dtNODP
+\newcount\dtMAP \newcount\dtJ \newcount\dtFRONT \newcount\dtBACK
+\newcount\dtSC \newcount\dtRW \newcount\dtRF \newcount\dtRC
+\newcount\dtTT \newcount\dtTF \newcount\dtNTH \newcount\dtTB
+\newcount\dtLSP \newcount\dtLFL \newcount\dtPEG \newcount\dtPGB
+\newcount\dtLTG \newcount\dtSCG
+
+%%% Doom sectors carry texture names, not palette ramps, so pick a ramp per
+%%% sector to keep adjacent rooms visually distinct.
+%%%
+%%% Not every palette row can serve as a ramp base.  The built-in palette is
+%%% sixteen monotonic ramps of sixteen by construction, but a real PLAYPAL is
+%%% not: rows 9, 10 and 14 each hold *two* eight-entry ramps, and rows 0 and 15
+%%% mix unrelated colours.  The renderer emits shades 0..13 from a base, so
+%%% basing a surface on one of those rows walks off the end of the ramp and the
+%%% surface jumps in brightness halfway down.  These eleven bases -- 16, 32,
+%%% 48, 64, 80, 96, 112, 128, 176, 192, 208 -- are the rows that descend
+%%% monotonically across the whole range the renderer can emit.  Each table
+%%% below is a permutation of exactly those eleven.
+%%%
+%%% The first three entries are load bearing: they reproduce the built-in
+%%% map's own sector ramps, which is what lets check.py compare a parsed WAD
+%%% against the hand-written level.  Reordering them does not "only" break
+%%% pixel identity -- \dtEdges keys on the ramp index, so it breaks the
+%%% geometry comparison too.  Change these three and you lose the strongest
+%%% check in the project.
+\def\dtRampW#1{\ifcase#1 64\or128\or192\or32\or176\or208\or16\or48\or80\or
+  96\or112\else64\fi}
+\def\dtRampF#1{\ifcase#1 32\or112\or80\or16\or208\or64\or176\or192\or48\or
+  96\or128\else32\fi}
+\def\dtRampC#1{\ifcase#1 176\or192\or96\or48\or16\or112\or208\or32\or64\or
+  80\or128\else176\fi}
+\def\dtSectorRamps#1{%
+  \dtSC=#1\relax
+  \tmpb=\dtSC \divide\tmpb by11 \multiply\tmpb by11
+  \advance\dtSC by-\tmpb
+  \dtRW=\dtRampW{\the\dtSC}\relax
+  \dtRF=\dtRampF{\the\dtSC}\relax
+  \dtRC=\dtRampC{\the\dtSC}\relax}
+
+\def\dtLoadWAD#1#2{%
+  \gdef\dtWADFILE{#1}%
+  \ifnum\pdffilesize{#1}=0
+    \message{^^J[wad] cannot open #1 -- keeping the built-in map.^^J}%
+  \else
+    \message{^^J[wad] #1 (\pdffilesize{#1} bytes)}%
+    \dtNUML=\dtL{4}\relax
+    \dtDIR=\dtL{8}\relax
+    \message{[wad] \the\dtNUML\space lumps, directory at \the\dtDIR}%
+    \dtFindLump{#2}{0}%
+    \ifnum\dtFOUND<0
+      \message{[wad] map #2 not found -- keeping the built-in map.}%
+    \else
+      \dtMAP=\dtFOUND
+      %% The map's lumps follow its marker in a fixed order.
+      \dtFindLump{VERTEXES}{\the\dtMAP}\dtVP=\dtLPOS \dtNV=\dtLSIZE
+        \divide\dtNV by4
+      \dtFindLump{SIDEDEFS}{\the\dtMAP}\dtSDP=\dtLPOS \dtNSD=\dtLSIZE
+        \divide\dtNSD by30
+      \dtFindLump{SECTORS}{\the\dtMAP}\dtSEP=\dtLPOS \dtNSE=\dtLSIZE
+        \divide\dtNSE by26
+      \dtFindLump{LINEDEFS}{\the\dtMAP}\dtLDP=\dtLPOS \dtNLD=\dtLSIZE
+        \divide\dtNLD by14
+      \dtFindLump{SEGS}{\the\dtMAP}\dtSGP=\dtLPOS \dtNSG=\dtLSIZE
+        \divide\dtNSG by12
+      \dtFindLump{SSECTORS}{\the\dtMAP}\dtSSP=\dtLPOS \dtNSS=\dtLSIZE
+        \divide\dtNSS by4
+      \dtFindLump{NODES}{\the\dtMAP}\dtNODP=\dtLPOS \dtNND=\dtLSIZE
+        \divide\dtNND by28
+      \message{[wad] #2: \the\dtNV\space verts, \the\dtNLD\space lines,
+        \the\dtNSD\space sides, \the\dtNSE\space sectors, \the\dtNSG\space
+        segs, \the\dtNSS\space subsectors, \the\dtNND\space nodes}%
+      \ifnum\dtNND<1
+        \message{[wad] no BSP in this map -- cannot render it.}%
+      \else
+        %% ---- VERTEXES: two int16
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNV}{%
+          \edef\dt@x{\dtS{\number\numexpr\dtVP+4*\dtJ\relax}}%
+          \edef\dt@y{\dtS{\number\numexpr\dtVP+4*\dtJ+2\relax}}%
+          \expandafter\expandafter\expandafter\dtAddVert
+            \expandafter\expandafter\expandafter{\expandafter\dt@x
+            \expandafter}\expandafter{\dt@y}%
+          \advance\dtJ by1\relax }%
+        %% ---- SIDEDEFS: x and y offset, three texture names, sector.
+        %% Naming a texture here is what puts it on the want list; the
+        %% composite is built later, once the whole list is known.
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNSD}{%
+          \dtTexRef{\number\numexpr\dtSDP+30*\dtJ+4\relax}%
+          \edef\dt@sdu{\the\dtXN}%
+          \dtTexRef{\number\numexpr\dtSDP+30*\dtJ+12\relax}%
+          \edef\dt@sdl{\the\dtXN}%
+          \dtTexRef{\number\numexpr\dtSDP+30*\dtJ+20\relax}%
+          \edef\dt@sdm{\the\dtXN}%
+          \edef\dt@next{\noexpand\dtAddSide
+            {\dtUu{\number\numexpr\dtSDP+30*\dtJ+28\relax}}%
+            {\dt@sdu}{\dt@sdl}{\dt@sdm}%
+            {\dtS{\number\numexpr\dtSDP+30*\dtJ\relax}}%
+            {\dtS{\number\numexpr\dtSDP+30*\dtJ+2\relax}}}%
+          \dt@next
+          \advance\dtJ by1\relax }%
+        %% ---- SECTORS: floor, ceiling, light at byte 20
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNSE}{%
+          \edef\dt@f{\dtS{\number\numexpr\dtSEP+26*\dtJ\relax}}%
+          \edef\dt@c{\dtS{\number\numexpr\dtSEP+26*\dtJ+2\relax}}%
+          \edef\dt@l{\dtUu{\number\numexpr\dtSEP+26*\dtJ+20\relax}}%
+          \dtSectorRamps{\the\dtJ}%
+          \edef\dt@next{\noexpand\dtAddSector{\dt@f}{\dt@c}{\dt@l}%
+            {\the\dtRW}{\the\dtRF}{\the\dtRC}}%
+          \dt@next
+          %% floorpic at byte 4, ceilingpic at byte 12.  Naming one here is
+          %% what puts it on the want list; the 4096 bytes are read later,
+          %% once the whole list is known.  The ramps above stay: a flat that
+          %% does not resolve falls back to them.
+          \dtFlatRef{\number\numexpr\dtSEP+26*\dtJ+4\relax}%
+          \expandafter\xdef\csname dtAf\the\dtJ\endcsname{\the\dtFN}%
+          \dtFlatRef{\number\numexpr\dtSEP+26*\dtJ+12\relax}%
+          \expandafter\xdef\csname dtAc\the\dtJ\endcsname{\the\dtFN}%
+          %% byte 24 is the sector tag: which tagged linedefs act on it.
+          %% Only nonzero tags are stored; \dtSecTag reports 0 for the rest.
+          \dtSCG=\dtS{\number\numexpr\dtSEP+26*\dtJ+24\relax}\relax
+          \ifnum\dtSCG=0\else
+            \edef\dt@next{\noexpand\dtAddSectorTag{\the\dtJ}{\the\dtSCG}}%
+            \dt@next
+          \fi
+          %% byte 22 is the sector's own special: a light that strobes, a
+          %% floor that burns, a secret.  Nonzero ones only, as with the tag.
+          \dtSCG=\dtS{\number\numexpr\dtSEP+26*\dtJ+22\relax}\relax
+          \ifnum\dtSCG=0\else
+            \edef\dt@next{\noexpand\dtAddSectorSpec{\the\dtJ}{\the\dtSCG}}%
+            \dt@next
+          \fi
+          \advance\dtJ by1\relax }%
+        %% ---- LINEDEFS: front and back sector via the sidedefs
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNLD}{%
+          \dtFRONT=\dtUu{\number\numexpr\dtLDP+14*\dtJ+10\relax}\relax
+          \dtBACK=\dtUu{\number\numexpr\dtLDP+14*\dtJ+12\relax}\relax
+          \edef\dt@fs{\ifnum\dtFRONT<\dtNSD
+            \csname dtYs\the\dtFRONT\endcsname\else-1\fi}%
+          \edef\dt@bs{\ifnum\dtBACK=65535 -1\else
+            \ifnum\dtBACK<\dtNSD \csname dtYs\the\dtBACK\endcsname
+            \else-1\fi\fi}%
+          \edef\dt@next{\noexpand\dtAddLine{\dt@fs}{\dt@bs}}%
+          \dt@next
+          %% The sidedefs themselves, and the two pegging bits of the flags
+          %% word at byte 4.  Pegging decides where a texture's v origin
+          %% sits, and getting it wrong is most visible on doors: an upper
+          %% that is NOT unpegged tracks the moving ceiling, which is what
+          %% makes the slab travel with the door instead of standing still.
+          \dtLFL=\dtUu{\number\numexpr\dtLDP+14*\dtJ+4\relax}\relax
+          \dtPEG=\dtLFL \divide\dtPEG by8
+          \tmpd=\dtPEG \divide\tmpd by2 \multiply\tmpd by2
+          \advance\dtPEG by-\tmpd
+          \dtPGB=\dtLFL \divide\dtPGB by16
+          \tmpd=\dtPGB \divide\tmpd by2 \multiply\tmpd by2
+          \advance\dtPGB by-\tmpd
+          \multiply\dtPGB by2 \advance\dtPEG by\dtPGB
+          %% ML_SOUNDBLOCK, bit 6 of the same flags word: the flag a mapper
+          %% sets to keep one room from hearing the next.  M20's noise flood
+          %% crosses at most one of these, and only nonzero ones are stored,
+          %% so a map without any costs nothing and the built-in level needs
+          %% no changes.
+          \tmpd=\dtLFL \divide\tmpd by64
+          \dtPGB=\tmpd \divide\dtPGB by2 \multiply\dtPGB by2
+          \advance\tmpd by-\dtPGB
+          \ifnum\tmpd=1
+            \edef\dt@next{\noexpand\dtAddLineSound{\the\dtJ}}\dt@next
+          \fi
+          \edef\dt@next{\noexpand\dtAddLineSide{\the\dtJ}%
+            {\ifnum\dtFRONT<\dtNSD \the\dtFRONT\else-1\fi}%
+            {\ifnum\dtBACK<\dtNSD \the\dtBACK\else-1\fi}%
+            {\the\dtPEG}}%
+          \dt@next
+          %% byte 6 is the linedef special: what the line does when used or
+          %% crossed.  Only nonzero ones are stored; \dtLineSpec reports 0 for
+          %% the rest, so the built-in map needs no changes.
+          \dtLSP=\dtUu{\number\numexpr\dtLDP+14*\dtJ+6\relax}\relax
+          \ifnum\dtLSP>0
+            \edef\dt@next{\noexpand\dtAddLineSpec{\the\dtJ}{\the\dtLSP}}%
+            \dt@next
+          \fi
+          %% byte 8 is the tag.  A manual door acts on its own back sector and
+          %% carries tag 0; every other special acts on the sectors carrying
+          %% this number, however far away they are, so the tag is the only
+          %% link between the two and cannot be recovered from the geometry.
+          \dtLTG=\dtS{\number\numexpr\dtLDP+14*\dtJ+8\relax}\relax
+          \ifnum\dtLTG=0\else
+            \edef\dt@next{\noexpand\dtAddLineTag{\the\dtJ}{\the\dtLTG}}%
+            \dt@next
+          \fi
+          \advance\dtJ by1\relax }%
+        %% ---- SEGS: v1, v2, linedef, side
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNSG}{%
+          \edef\dt@a{\dtUu{\number\numexpr\dtSGP+12*\dtJ\relax}}%
+          \edef\dt@b{\dtUu{\number\numexpr\dtSGP+12*\dtJ+2\relax}}%
+          \edef\dt@ld{\dtUu{\number\numexpr\dtSGP+12*\dtJ+6\relax}}%
+          \edef\dt@sd{\dtUu{\number\numexpr\dtSGP+12*\dtJ+8\relax}}%
+          \edef\dt@next{\noexpand\dtAddSeg{\dt@a}{\dt@b}{\dt@ld}{\dt@sd}}%
+          \dt@next
+          %% byte 10: how far along the linedef this seg starts.  Without it
+          %% every seg restarts its texture at u=0 and a wall split by the
+          %% BSP shows a seam at each split.
+          \edef\dt@next{\noexpand\dtAddSegOff{\the\dtJ}%
+            {\dtS{\number\numexpr\dtSGP+12*\dtJ+10\relax}}}%
+          \dt@next
+          \advance\dtJ by1\relax }%
+        %% ---- SSECTORS: seg count, first seg
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNSS}{%
+          \edef\dt@n{\dtUu{\number\numexpr\dtSSP+4*\dtJ\relax}}%
+          \edef\dt@f{\dtUu{\number\numexpr\dtSSP+4*\dtJ+2\relax}}%
+          \edef\dt@next{\noexpand\dtAddSSec{\dt@n}{\dt@f}}%
+          \dt@next
+          \advance\dtJ by1\relax }%
+        %% ---- NODES: partition line and the two children.  The bounding
+        %% ---- boxes at bytes 8..23 are skipped: this renderer prunes with
+        %% ---- the open-column count instead of CheckBBox.
+        \dtJ=0
+        \dtWhile{\dtJ<\dtNND}{%
+          \edef\dt@x{\dtS{\number\numexpr\dtNODP+28*\dtJ\relax}}%
+          \edef\dt@y{\dtS{\number\numexpr\dtNODP+28*\dtJ+2\relax}}%
+          \edef\dt@u{\dtS{\number\numexpr\dtNODP+28*\dtJ+4\relax}}%
+          \edef\dt@v{\dtS{\number\numexpr\dtNODP+28*\dtJ+6\relax}}%
+          \edef\dt@cr{\dtUu{\number\numexpr\dtNODP+28*\dtJ+24\relax}}%
+          \edef\dt@cl{\dtUu{\number\numexpr\dtNODP+28*\dtJ+26\relax}}%
+          \edef\dt@next{\noexpand\dtAddNode{\dt@x}{\dt@y}{\dt@u}{\dt@v}%
+            {\dt@cr}{\dt@cl}}%
+          \dt@next
+          \advance\dtJ by1\relax }%
+        %% Doom's root node is the last one built.
+        \DTROOT=\numexpr\NNODE-1\relax
+        \message{[wad] loaded: \the\NVERT\space verts, \the\NLINE\space lines,
+          \the\NSEC\space sectors, \the\NSEG\space segs, \the\NSSEC\space
+          subsectors, \the\NNODE\space nodes, root \the\DTROOT}%
+        %% COLORMAP first: walls shade through it now, not only sprites, so
+        %% it is no longer part of the thing loader and a map with no THINGS
+        %% still gets its shading.  Textures follow, once every sidedef has
+        %% had its say about which ones the map needs.
+        \dtLoadColormap
+        \dtLoadTextures
+        \dtLoadFlats
+      \fi
+      %% ---- PLAYPAL: 768 bytes of RGB is exactly a PDF indexed colour space
+      \dtFindLump{PLAYPAL}{0}%
+      \ifnum\dtFOUND<0
+        \message{[wad] no PLAYPAL -- keeping the built-in palette.}%
+      \else
+        \xdef\DTPAL{\pdffiledump offset \the\dtLPOS\space length 768
+          {\dtWADFILE}}%
+        \message{[wad] PLAYPAL installed (the real Doom palette)}%
+      \fi
+      %% ---- THINGS: player 1 start is thing type 1
+      \dtFindLump{THINGS}{\the\dtMAP}%
+      \ifnum\dtFOUND<0\else
+        %% \tmpa cannot be the loop bound here: \dtnorm below writes to it,
+        %% and so does \dtPointSide in the second pass.
+        \dtNTH=\dtLSIZE \divide\dtNTH by10
+        \dtJ=0 \dtFOUND=-1
+        \dtWhile{\dtJ<\dtNTH}{%
+          \ifnum\dtFOUND<0
+            \ifnum\dtUu{\number\numexpr\dtLPOS+10*\dtJ+6\relax}=1
+              \dtFOUND=\dtJ
+              \PX=\numexpr\dtS{\number\numexpr\dtLPOS+10*\dtJ\relax}%
+                   *65536\relax
+              \PY=\numexpr\dtS{\number\numexpr\dtLPOS+10*\dtJ+2\relax}%
+                   *65536\relax
+              %% Doom stores the angle in degrees; 8192 units to a full turn
+              \dtnorm\PA{\dtUu{\number\numexpr\dtLPOS+10*\dtJ+4\relax}%
+                *8192/360}%
+            \fi
+          \fi
+          \advance\dtJ by1\relax }%
+        \ifnum\dtFOUND<0\else
+          \message{[wad] player start
+            \number\numexpr\PX/65536\relax,\number\numexpr\PY/65536\relax\space
+            angle \the\PA}%
+        \fi
+        %% ---- every other thing, for the sprite pass.  A thing stands on the
+        %% ---- floor of whatever sector contains it, which is exactly what
+        %% ---- M1's point locator answers -- so this needs the BSP loaded.
+        \ifnum\NNODE>0
+          \dtJ=0
+          \dtWhile{\dtJ<\dtNTH}{%
+            \dtTT=\dtUu{\number\numexpr\dtLPOS+10*\dtJ+6\relax}\relax
+            \dtTF=\dtUu{\number\numexpr\dtLPOS+10*\dtJ+8\relax}\relax
+            \dtTB=\dtTF \divide\dtTB by16
+            \tmpd=\dtTB \divide\tmpd by2 \multiply\tmpd by2
+            \advance\dtTB by-\tmpd
+            %% flags bit 4 is MTF_NOTSINGLE: multiplayer only
+            \ifnum\dtTB=1 \else
+              \dtPSX=\dtS{\number\numexpr\dtLPOS+10*\dtJ\relax}\relax
+              \dtPSY=\dtS{\number\numexpr\dtLPOS+10*\dtJ+2\relax}\relax
+              \dtPointInSSec
+              \edef\dt@next{\noexpand\dtAddThing{\the\dtPSX}{\the\dtPSY}%
+                {\the\dtTT}{\csname dtSf\the\dtSECN\endcsname}}%
+              \dt@next
+              %% the sector's light, for shading the sprite through COLORMAP,
+              %% and the thing's own facing, for picking its rotation.  Doom
+              %% stores the angle in degrees.  \dtAddThing has already
+              %% advanced \NTHING.
+              \expandafter\xdef\csname dtHl\number\numexpr\NTHING-1\relax
+                \endcsname{\csname dtSl\the\dtSECN\endcsname}%
+              %% ...and the sector itself, which the point locator has just
+              %% answered and nothing else here ever asks it again: a
+              %% teleporter finds its destination by it, and a thing in a
+              %% strobing room is lit by it frame by frame.
+              \expandafter\xdef\csname dtHs\number\numexpr\NTHING-1\relax
+                \endcsname{\the\dtSECN}%
+              \expandafter\xdef\csname dtHa\number\numexpr\NTHING-1\relax
+                \endcsname{\number\numexpr
+                  \dtUu{\number\numexpr\dtLPOS+10*\dtJ+4\relax}*8192/360\relax}%
+            \fi
+            \advance\dtJ by1\relax }%
+          \message{[wad] \the\NTHING\space things placed}%
+          %% Only the pictures this map actually needs: a full sprite set is
+          %% 1381 lumps and a map uses a dozen.
+          \dtJ=0
+          \dtWhile{\dtJ<\NTHING}{%
+            \edef\dt@wty{\csname dtHt\the\dtJ\endcsname}%
+            \edef\dt@k{\dtSpriteKey{\dt@wty}}%
+            \ifx\dt@k\dt@empty\else
+              %% An animated type needs every frame of its sequence, not just
+              %% the one \dtSN names, or \dt@animframe asks for a picture that
+              %% was never read and the thing drops to its rotation 0.
+              \ifcsname dtMA\dt@wty\endcsname
+                \expandafter\dt@wantall\expandafter{\dt@k}%
+              \else
+                \edef\dt@next{\noexpand\dtWantSprite{\dt@k}}\dt@next
+              \fi
+              %% ...and a monster needs every frame of every STATE, which is
+              %% the same argument one level up: walking, shooting, flinching
+              %% and dying are four more sequences and a zombieman that dies
+              %% into a picture nobody read turns into a coloured billboard
+              %% on its last frame.  A type that is not in the monster table
+              %% costs one \ifcsname that misses.
+              %%
+              %% Not under \DTNOMON, which is why this reads a configuration
+              %% macro the way \dtLoadTextures reads \DTNOTEX: with nothing
+              %% spawned, every monster stays on its spawn frame for the
+              %% whole run and the other four sequences are ninety pictures
+              %% nobody will look at.  It takes the doom2 MAP01 load back to
+              %% what it was before M15, which is what the dozen fixtures
+              %% that set \DTNOMON want anyway.
+              \expandafter\ifx\csname DTNOMON\endcsname\relax
+                \ifcsname dtOq\dt@wty\endcsname
+                  \expandafter\dt@wantstates\expandafter{\dt@k}%
+                \fi
+              \fi
+            \fi
+            %% Outside the \ifx above that tests dt@k, because a missile's
+            %% pictures do not hang off this thing's sprite key at all -- and
+            %% outside \DTNOMON, because the player throws two of the three
+            %% whether or not anything else on the map is awake.  Under
+            %% \DTNOMIS none of it is read, which is the load M15 left.
+            \expandafter\ifx\csname DTNOMIS\endcsname\relax
+              \ifcsname dtJm\dt@wty\endcsname
+                \edef\dt@next{\noexpand\dt@wantmissile
+                  {\csname dtJm\dt@wty\endcsname}}\dt@next
+              \fi
+            \fi
+            \advance\dtJ by1\relax }%
+          %% The weapons are ordinary sprite lumps, so they ride along on the
+          %% sprite pass -- which is what makes picking one up show it: the
+          %% HUD reads dtUS<weapon> and the picture is already there.
+          \dtWantSprite{PUNGA}\dtWantSprite{PISGA}\dtWantSprite{SHTGA}%
+          \dtWantSprite{CHGGA}\dtWantSprite{MISGA}\dtWantSprite{PLSGA}%
+          \dtWantSprite{BFGGA}\dtWantSprite{SAWGA}\dtWantSprite{SHT2A}%
+          \dtLoadSprites
+          %% The bar and its numbers are not sprites: they live in the main
+          %% directory, so they are wanted by name and resolved in one pass.
+          \dt@wanthud
+          \dtLoadGfxAll
+          \message{[wad] hud: \the\dtGN\space pictures}%
+          \ifcsname dtPwSTBAR\endcsname
+            \message{[wad] STBAR: \csname dtPwSTBAR\endcsname x\csname dtPhSTBAR\endcsname}%
+          \else \message{[wad] no STBAR}\fi
+        \fi
+      \fi
+    \fi
+  \fi}
+\catcode`\@=12
