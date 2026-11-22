@@ -34,7 +34,7 @@ fixture there, so nothing it writes lands beside the sources and editing
 through reading -- which it used to, and §11 records what that cost.
 `python3 check.py --clean` removes `build/`.
 
-351 checks with an IWAD present and 221 without, plus two for the benchmark
+352 checks with an IWAD present and 222 without, plus two for the benchmark
 unless `--quick` skips it. The load-bearing ones:
 
 | invariant | why it catches things |
@@ -3294,3 +3294,18 @@ so under the off switch the secrets were counted anyway. The guard is inside
 the macro now. It is the `\DTUSE`-before-`\DTHOOK` trap of §6 from the other
 direction: a setting read in one place does not bind code reached from
 another.
+
+### One more, found while recording the Doom II clip
+
+**The palette section stays open until the first frame, and the first tick
+talks inside it.** `[DTPAL]` goes out once, before the loop starts, and
+nothing closes it but the first `[DTS]` -- so whatever the engine says
+during the first tick lands between the two. `play.py` took every
+hex-looking fragment of that as more palette: a hook that logged monster
+positions put a handful of stray digits on the end, the string came out an
+odd length, and `bytes.fromhex` refused it before a single frame was drawn.
+A secret sector under the player start would have done the same. The
+palette is now the lines that are hex and nothing else, cut to 256 entries,
+and the rest is passed on as what it is: the engine talking. One check
+(`\message{abc}` on every tick -- three hex digits, the worst case) and one
+mutation, `palette-takes-every-hex-digit`, which makes 126.

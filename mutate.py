@@ -724,6 +724,13 @@ MUTS = {
  "sector-special-read-from-the-tag": ("wad.tex",
     r"          \dtSCG=\dtS{\number\numexpr\dtSEP+26*\dtJ+22\relax}\relax",
     r"          \dtSCG=\dtS{\number\numexpr\dtSEP+26*\dtJ+24\relax}\relax"),
+ # ---- the front-end ------------------------------------------------------
+ # The palette is whatever hex arrived before the first frame, all of it:
+ # three stray digits from the engine make an odd-length string, and the
+ # front-end dies before it has drawn anything.
+ "palette-takes-every-hex-digit": ("play.py",
+    "    raw = bytes.fromhex(digits[:len(digits) // 2 * 2])",
+    '    raw = bytes.fromhex("".join(HEXLINE.findall(hexstr)))'),
 }
 
 

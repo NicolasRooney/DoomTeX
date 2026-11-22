@@ -2578,6 +2578,21 @@ def main():
               "starting 100 units east diverges at once"
               if "DIVERGED" in r.stdout else r.stdout.strip()[-70:])
 
+    # The palette goes out once, before the first tick, so whatever the
+    # engine SAYS during that tick arrives between it and the first frame --
+    # a secret found where the level starts is enough.  play.py used to take
+    # every hex-looking fragment of that as more palette, and three stray
+    # digits made an odd-length string that bytes.fromhex refused: the
+    # front-end died before drawing anything.  The hook here says `abc' on
+    # every tick, which is three hex digits and nothing else.
+    r = sh(f'{PY} play.py --record chkmsg.dtd --w 76 --h 60 --job chkmsg '
+           f'--define "DTHOOK=\\let\\ptwas\\dtPlayerTick'
+           f'\\def\\dtPlayerTick{{\\ptwas\\message{{abc}}}}"',
+           stdin="w\nw\nq\n")
+    check("play.py is not confused by the engine talking before the first "
+          "frame", r.returncode == 0 and "3 frames" in r.stdout,
+          firstline(r))
+
     # A WAD path reaches the engine as TeX source, so it has to survive being
     # read as one.  `.\test.wad' is what shell completion on Windows hands
     # over, and it used to go into the fixture verbatim and make \test an

@@ -253,6 +253,21 @@ class Engine:
                     # share this stream and contain digits.
                     if s and HEXLINE.fullmatch(s):
                         hexbuf.append(s)
+                elif sec == "[DTPAL]":
+                    # The palette is written once, before the first tick --
+                    # so anything the engine SAYS during that tick arrives
+                    # here, between the palette and the first [DTS]: a secret
+                    # found on the spot the level starts, a warning, a
+                    # fixture's own message.  The palette is the lines that
+                    # are hex and nothing else, the same rule the frame data
+                    # is read by; everything else is the engine talking.
+                    s = line.strip()
+                    if s and HEXLINE.fullmatch(s):
+                        buf.append(s)
+                    elif line:
+                        self.preamble.append(line)
+                        if self.trace:
+                            self.trace(line)
                 elif sec is not None:
                     buf.append(line)
                 elif line:
@@ -399,7 +414,11 @@ def unpal(hexstr):
     """768 hex bytes -> 256 (r, g, b).  The engine sends its own palette
     because it is the only thing that knows which one it is using: the
     built-in ramps until a WAD replaces them with PLAYPAL."""
-    raw = bytes.fromhex("".join(HEXLINE.findall(hexstr)))
+    # Exactly 256 entries, and only whole bytes: the buffer is the palette
+    # followed by whatever else looked like hex before the first frame, and
+    # an odd digit on the end of it is not a reason to lose the picture.
+    digits = "".join(HEXLINE.findall(hexstr))[:1536]
+    raw = bytes.fromhex(digits[:len(digits) // 2 * 2])
     return [tuple(raw[3 * i:3 * i + 3]) for i in range(len(raw) // 3)]
 
 

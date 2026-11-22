@@ -27,6 +27,14 @@ With a Doom WAD beside it, it renders — and plays — the real thing:
 python3 play.py --wad doom2.wad --map MAP01
 ```
 
+![The opening of Doom II's MAP01, played in pdfTeX](doom2-map01.gif)
+
+*The opening of Doom II's MAP01 at 320x200: five zombiemen, a staircase,
+a door and the courtyard behind it. It is a replay of 110 recorded
+keypresses, one frame a key, and again every pixel came out of `pdftex`. The
+artwork is id Software's, read from a copy of `doom2.wad` that is not in
+this repository.*
+
 It runs under `pdflatex` too, unmodified and still with no packages, producing
 pixel-identical output:
 
@@ -878,6 +886,7 @@ costs tens of those, so expect minutes per frame — a filmstrip, not a game.
 | `test.wad` | a real PWAD of the built-in map, with a hand-built BSP — the harness loads it and requires the same picture |
 | `play.py` `gif.py` `dump.py` | the front-end and the two exporters |
 | `check.py` `mutate.py` `maketest.py` | the regression harness, its mutation table, and the generator for `test.wad` |
+| `demo.gif` `doom2-map01.gif` | the two recordings at the top of this page: the built-in map, and the start of Doom II |
 | `INTERNALS.md` | the engineering notes: the data model, every pipeline, the TeX traps in full, what each milestone cost and what each mutation found |
 | `LICENSE` | the GNU General Public License, version 2 |
 
@@ -902,6 +911,9 @@ it.
 
 Doom and Doom II are id Software's. This repository contains none of their
 data: the engine reads its artwork and its maps out of a WAD that you supply.
+The one place their artwork appears is `doom2-map01.gif`, a few seconds of
+the engine running on Doom II, shown here as a demonstration of what it
+does; it is theirs and the licence above does not cover it.
 It is a reimplementation in another language rather than a translation, but
 it follows the structure of the released Doom source closely — the comments
 name the functions each macro corresponds to — and the numbers in its tables,
